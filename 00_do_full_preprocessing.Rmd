@@ -1,0 +1,1215 @@
+---
+title: "preprocessing steps"
+output:
+  html_document:
+    df_print: paged
+---
+
+This notebook...   
+0) Setup  
+1) Collecting  
+  A) Creates a dataframe & CSV of all relevant information from the childes database  
+  B) Creates a dataframe & CSV of childes tokens with wordnet tags  
+2) Cleaning  
+    A) Runs participant quality measures + Creates random tags  
+    B) Drops lower quality participants  
+3) Preprocessing  
+    A) Creates Majority Tags
+  
+# Setup
+```{r}
+library(tidyverse)
+library(dbplyr)
+library(here)
+library(childesr)
+library(rjson)
+library(reticulate)
+#source(here("code/scripts/functions/00_general_functions.R"))
+reticulate::use_virtualenv(here("ws_env"))
+wn <- import("nltk.corpus")$wordnet
+lemmatizer <- import("nltk.stem")$WordNetLemmatizer
+childes_to_wordnet_pos <- c("a", "n", "v", "r", "a", "r")
+names(childes_to_wordnet_pos) <- c("adj", "n", "v", "adv", "a", "r")
+
+read_path <- here("data/raw_data/")
+write_path <- here("data/processed_data/")
+figs_path <- here("data/figures/")
+```
+
+# Collecting and Organizing Data
+
+```{r connecting-remotely}
+# If connecting to the wordsense-db live, uncomment the following code to regenerate the raw wordsense tags csvs and the wordnet table
+# If you'd like to use this option, you'll need a config file with the password to the wordsense database
+connect_to_wordsense <- function() {
+  ws_info <- config::get(file = here("configs/config.yml"), "wordsense")
+  con <- DBI::dbConnect(RPostgres::Postgres(),
+                        dbname = ws_info$database,
+                        host = ws_info$host,
+                        port = ws_info$port,
+                        password = ws_info$pwd,
+                        user = ws_info$user
+  )
+  return(con)
+}
+
+ws_con <- connect_to_wordsense()
+
+# collect all necessary tables
+
+derived_tokens_df <- dplyr::tbl(ws_con, "derived_tokens") %>%
+    dplyr::collect()
+raw_tags_df <- dplyr::tbl(ws_con, "tags") %>%
+  dplyr::collect()
+participant_df <- dplyr::tbl(ws_con, "participant") %>%
+  dplyr::collect()
+wordnet30_df <- dplyr::tbl(ws_con, "wordnet30") %>%
+  dplyr::collect()
+work_unit_content_tbl <- dplyr::tbl(ws_con, "work_unit_content") %>%
+  dplyr::collect()
+
+# Save to CSVs
+write_csv(derived_tokens_df, file = paste0(read_path, "/derived_tokens.csv"))
+write_csv(raw_tags_df, file = paste0(read_path, "/raw_tags.csv"))
+write_csv(participant_df, file = paste0(read_path, "/participant.csv"))
+write_csv(wordnet30_df, file = paste0(read_path, "/wordnet30.csv"))
+write_csv(work_unit_content_tbl, file = paste0(read_path, "/work_unit_content.csv"))
+```
+
+```{r reading raw csvs, message=FALSE}
+derived_tokens_df <-  read_csv(file = paste0(read_path, "/derived_tokens.csv"))
+raw_tags_df <- read_csv(file = paste0(read_path, "/raw_tags.csv"),
+                        col_types = cols(timestamp = col_datetime()))
+
+participant_df <-  read_csv(file = paste0(read_path, "/participant.csv"),
+                            col_types = cols(worker_id = col_character()))
+
+wordnet30_df <- read_csv(file = paste0(read_path, "/wordnet30.csv"))
+
+work_unit_content_tbl <- read_csv(file = paste0(read_path, "/work_unit_content.csv"))
+```
+
+## Collecting and processing CHILDES token information
+```{r childes-token-info}
+message("Collecting Token Information...")
+#collect childes info from childes-db
+childes_tokens <- childesr::get_tokens(token = "*",
+                                         corpus= c("Manchester", "Providence"),
+                                         db_version = "2018.1")
+utterances <- childesr::get_utterances(corpus= c("Manchester", "Providence"),
+                                         db_version = "2018.1")
+```
+## Collecting and processing Wordsense tags
+```{r warning=FALSE}
+#source(here("code/scripts/functions/01_preprocessing_functions.R"))
+message("Preprocess childes tokens...")
+#base preprocessing
+
+pvd_in_lab_part_ids <- c(59, 65, 73, 81, 88, 305, 306, 651, 652, 653, 654)
+#UK
+man_in_lab_part_ids <- c(74, 79, 80, 84, 87, 568, 569)
+
+drop_researchers_tags <- function(raw_df){
+  to_drop <- fromJSON(file = here("code/scripts/functions/disallow_participants.json"))
+  researchers <- to_drop$researchers
+  clean_tags_df <- subset(raw_df, !(participant_id %in% researchers))
+  return(clean_tags_df)
+}
+
+get_majority_random_tag <- function(raw_tag_df) {
+  pb$tick()
+  sense_counts <- raw_tag_df %>% group_by(sense_id) %>% tally()
+  max_sense_count <- max(sense_counts$n)
+  #get most frequent sense(s)
+  max_senses <- sense_counts %>% filter(n == max_sense_count)
+
+  return_df <- raw_tag_df %>%
+    filter(sense_id %in% max_senses$sense_id)
+
+  if (nrow(max_senses) == 1){
+    #if there is just one max sense, select that sense
+    return_df <- return_df %>% slice_head(n=1) %>% mutate(tie = FALSE)
+    return(return_df)
+  } else{
+    return_df <- return_df %>% arrange(sense_id) %>% slice_sample(n=1) %>% mutate(tie = TRUE)
+    return(return_df)
+  }
+}
+
+downsample_pos <- function(full_pos){
+  if (full_pos %in%  names(childes_to_wordnet_pos)){
+    return(full_pos)
+  } else if (str_split(full_pos, ":")[[1]][1] %in% names(childes_to_wordnet_pos)) {
+    return(str_split(full_pos, ":")[[1]][1])
+  } else if (' ' %in% str_split(full_pos, ":")[[1]]) {
+    return(NA)
+  } else {
+    return(NA)
+  }
+}
+
+cdi_list <- read_csv(here("data/raw_data/WSWG_50percentproducing_cleaned.csv"))
+cdi_list$lemma <- unlist(lapply(cdi_list$uni_lemma,
+                                function(uni_lemma){
+                                 str_trim(str_replace(uni_lemma, "[\\(\\[].*?[\\)\\]]", ""))}))
+
+cdi_list$stem_lemma <- unlist(lapply(cdi_list$lemma, function(lemma){lemmatizer$lemmatize(NULL, lemma)}))
+
+get_senses <- function(gloss, lemma, pos){
+  if (is.na(pos)){
+    return(c())
+  } else {
+    gloss_synsets <- unlist(lapply(wn$synsets(gloss, pos),
+                                 function(synset){synset$name()}))
+    lemma_sysets <- unlist(lapply(wn$synsets(lemma, pos),
+                                function(synset){synset$name()}))
+    all_synsets <- append(lemma_sysets, gloss_synsets)
+    all_synsets <- append(all_synsets, c("idk", "other_meanings", "wrong_pos"))
+    return(unique(all_synsets))
+  }
+}
+
+get_gloss_senses <- function(gloss, pos){
+  if (is.na(pos)){
+    return(c())
+  } else {
+    gloss_synsets <- unlist(lapply(wn$synsets(gloss, pos),
+                                 function(synset){synset$name()}))
+    all_synsets <- append(gloss_synsets, c("idk", "other_meanings", "wrong_pos"))
+    return(unique(all_synsets))
+  }
+}
+
+get_lemma_senses <- function(lemma, pos){
+  if (is.na(pos)){
+    return(c())
+  } else {
+    lemma_sysets <- unlist(lapply(wn$synsets(lemma, pos),
+                                function(synset){synset$name()}))
+    all_synsets <- append(lemma_sysets, c("idk", "other_meanings", "wrong_pos"))
+    return(unique(all_synsets))
+  }
+}
+
+age_interval_breaks <- seq(0, max(childes_tokens$target_child_age, na.rm = TRUE) + 3, by = 3)
+
+full_token_information <- childes_tokens %>% rename(childes_token_id = id) %>%
+  mutate(age_in_days = target_child_age * 30.43688,
+         age_interval = cut(.$target_child_age, breaks = age_interval_breaks,
+                      include.lowest = TRUE),
+         age_interval = ifelse(age_interval == "(9,12]", "(09,12]", as.character(age_interval)),
+         speaker_role = case_when(speaker_role == "Mother" ~ "Caregiver",
+                                  speaker_role == "Father" ~ "Caregiver",
+                                  speaker_role == "Target_Child" ~ "Child",
+                                  TRUE ~ "Other"))
+
+# Downsample POS
+distinct_gloss_pos <- full_token_information %>% distinct(gloss, part_of_speech)
+distinct_gloss_pos$downsampled_pos <- unlist(lapply(distinct_gloss_pos$part_of_speech, downsample_pos))
+distinct_gloss_pos$wn_pos <- unlist(lapply(distinct_gloss_pos$downsampled_pos,
+                                    function(downsampled_pos){
+                                      return(childes_to_wordnet_pos[downsampled_pos][[1]])}))
+#Lemmatize
+message("Lemmatizing...")
+distinct_gloss_pos$lemma <- mapply(function(gloss, pos){
+  if (is.na(pos)){return(NA)} else{
+  return(lemmatizer$lemmatize(NULL, gloss, pos))}}, 
+  distinct_gloss_pos$gloss, distinct_gloss_pos$wn_pos)
+
+message("Getting possible Senses...")
+distinct_gloss_pos$lemma_sense_options <- mapply(get_lemma_senses,
+                                           distinct_gloss_pos$lemma,
+                                           distinct_gloss_pos$wn_pos)
+distinct_gloss_pos$gloss_sense_options <- mapply(get_gloss_senses,
+                                           distinct_gloss_pos$gloss,
+                                           distinct_gloss_pos$wn_pos)
+
+distinct_gloss_pos$sense_options <- mapply(function(lemma_senses,
+                                                    gloss_senses){
+                                             return(unique(append(lemma_senses,
+                                                                  gloss_senses)))},
+                                           distinct_gloss_pos$lemma_sense_options, 
+                                           distinct_gloss_pos$gloss_sense_options
+                                           )
+#join in
+distinct_gloss_pos$num_poss_options <- unlist(lapply(distinct_gloss_pos$sense_options, length))
+distinct_gloss_pos$gloss_sense_count <- unlist(lapply(distinct_gloss_pos$gloss_sense_options, length))
+distinct_gloss_pos$lemma_sense_count <- unlist(lapply(distinct_gloss_pos$lemma_sense_options, length))
+
+distinct_gloss_pos <- distinct_gloss_pos %>% mutate(num_wn_senses = ifelse(num_poss_options >= 3, num_poss_options - 3, 0))
+
+
+full_token_information <- full_token_information %>% left_join(distinct_gloss_pos, by = c("gloss", "part_of_speech"))
+
+full_token_information <- full_token_information %>% 
+  mutate(type = ifelse(is.na(wn_pos), NA, paste0(lemma, "+", wn_pos, sep = "")),
+         in_cdi = ifelse(lemma %in% cdi_list$stem_lemma | lemma %in% cdi_list$word, TRUE, FALSE),
+         gloss_type = ifelse(is.na(wn_pos), NA, paste0(gloss, "+", wn_pos, sep = "")))
+full_token_information
+```
+
+```{r}
+#join in wordsense token information
+full_token_information <- full_token_information %>% 
+  left_join(derived_tokens_df %>% select(childes_token_id = token_id, token_id = id, requires_tags)) %>%
+  mutate(requires_tags = ifelse(is.na(requires_tags), FALSE, requires_tags)) %>%
+  left_join(utterances %>% select(utterance_id = id, utterance_gloss = gloss))
+```
+
+Save full token information
+```{r}
+#save as RDS (keeps the list of possible senses)
+#saveRDS(full_token_information, file = paste0(write_path, "/full_token_information.RData"))
+#write_csv(full_token_information %>% select(-sense_options, -lemma_sense_options, -gloss_sense_options), file = paste0(write_path, "/full_token_information.csv"))
+```
+
+```{r}
+message("Preprocess wordsense tags...")
+
+#collect participant data
+participant_df <- participant_df %>%
+    select(participant_id = id, user_type) %>% 
+  mutate(user_type = case_when(user_type == "subject_pool" ~ user_type,
+                               user_type == "berkeley_rpp" ~ "berkeley_rpp",
+                               user_type == "berkeley_two_hour_rpp" ~ "berkeley_rpp",
+                               user_type == "princeton_rpp" ~ "princeton_rpp",
+                               user_type == "edinburgh_two_hour_rpp" ~ "edinburgh_rpp",
+                               (participant_id %in% pvd_in_lab_part_ids) ~ "berkeley_in_lab_staff",
+                               (participant_id %in% man_in_lab_part_ids) ~ "edinburgh_in_lab_staff",
+                               user_type == "berkeley_ra_pool" ~ "berkeley_rpp",
+                               TRUE ~ "other"))
+
+#collect wordnet information
+wordnet30_df <- wordnet30_df %>%
+    select(sense_name = name,
+           sense_offset = offset,
+           sense_id = id,
+           sense_definition = definition,
+           sense_examples = examples)
+```
+
+```{r}
+wordsense_tags <- drop_researchers_tags(raw_tags_df)
+wordsense_tags <- wordsense_tags %>% 
+  left_join(participant_df, by = "participant_id") %>% 
+  left_join(wordnet30_df, by = "sense_id") %>%
+  mutate(sense_offset = as.numeric(sense_offset),
+    sense_offset = case_when(sense_id == 117666 ~ -1,
+                                sense_id == 117667 ~ -2,
+                                is.na(sense_id)~-3,
+                                TRUE ~ sense_offset),
+    sense_name = as.character(sense_name),
+    sense_name = case_when(sense_id == 117666 ~"idk",
+                                sense_id == 117667 ~ "other_meanings",
+                                is.na(sense_id)~"wrong_pos",
+                                TRUE ~ sense_name)
+    )
+wordsense_tags <- wordsense_tags %>% left_join(full_token_information %>% 
+                                                 select(-gloss, -stem, -part_of_speech, -downsampled_pos))
+temp_tags <- wordsense_tags %>% distinct(sense_name, sense_options)
+temp_tags$matching_sense <- mapply(function(sense, sense_options){sense %in% sense_options}, temp_tags$sense_name, temp_tags$sense_options)
+wordsense_tags <- wordsense_tags %>% left_join(temp_tags) %>% filter(matching_sense == TRUE) %>% select(-matching_sense)
+```
+```{r}
+temp_tags <- wordsense_tags %>% 
+  select(id, childes_token_id, gloss_with_replacement, 
+         wn_pos, fixed_pos, type, gloss_type, 
+         sense_name, sense_definition, utterance_id, 
+         age_interval, speaker_role,
+       lemma_sense_count, gloss_sense_count,
+         num_poss_options)
+temp_tags %>% write_csv(here("processed_data/wordsense_tags.csv"))
+```
+
+# Data Cleaning
+## Random Tags
+```{r}
+random_tags <- wordsense_tags %>% distinct(token_id, sense_options)
+
+random_tags$random_sense_name <- lapply(random_tags$sense_options, function(sense_options){return(sample(sense_options, 1))})
+random_tags <- wordsense_tags%>% group_by(token_id) %>% sample_n(1) %>% left_join(random_tags) %>%
+  select(-id, -sense_id, -timestamp, -c(sense_name:sense_examples), sense_name = random_sense_name) %>% mutate(participant_id = -99, user_type = 'random_participant')
+
+random_tags_bound <- rbind(wordsense_tags %>% select(participant_id, user_type, token_id, sense_name, utterance_id, transcript_id),
+                           random_tags %>% select(participant_id, user_type, token_id, sense_name, utterance_id, transcript_id))
+```
+## Participant Quality
+
+### Participant Quality - Setup
+```{r message=FALSE}
+source(here("code/scripts/functions/02_participant_quality_functions.R"))
+
+listed_tags <- random_tags_bound %>% filter(sense_name != "idk") %>%
+  group_by(token_id, participant_id, transcript_id) %>%
+  summarise(participant_tags = list(unique(sense_name)))
+```
+### PVD In Lab Training
+```{r message=FALSE, warning=FALSE}
+pvd_training_tags <- wordsense_tags %>% filter(transcript_id == 5686)
+
+pvd_in_lab_comparison <- create_comparisons(tag_set = pvd_training_tags,
+                                            target_user_types= c("berkeley_in_lab_staff"),
+                                            target_user_group = "in_lab_training")
+
+pvd_in_lab_comparison$corpus_name = "Providence"
+pvd_in_lab_comparison$work_unit <- NA
+```
+#### By Pair
+```{r}
+pvd_training_by_pair <- pvd_in_lab_comparison %>% 
+  group_by(participant_list, target_participant, comparison_participant, 
+           corpus_name,user_group) %>% 
+  summarize(num_comparisons = n(),
+            num_any_one = sum(any_one),
+            num_exact_match = sum(exact_match),
+            prop_any_one = num_any_one/num_comparisons,
+            prop_exact_match = num_exact_match/num_comparisons) %>% filter(num_comparisons >= 15)
+
+pvd_training_by_pair %>% pivot_longer(c(prop_any_one, prop_exact_match), names_to = "measure", values_to = "proportion") %>% ggplot() + geom_density(aes(x = proportion, fill = measure))+facet_grid(measure~ user_group, scales = "free_y") + theme_classic()
+```
+
+#### By Participant
+
+```{r}
+#pivot longer 
+pvd_training_by_participant <- pvd_training_by_pair %>% pivot_longer(c(target_participant, comparison_participant), names_to = "participant_comparison_type", values_to = "participant_id") %>%
+  group_by(participant_id) %>% summarize(participant_exact_mean = mean(prop_exact_match),
+                                         participant_any_mean = mean(prop_any_one))
+pvd_training_by_participant %>% pivot_longer(c(participant_any_mean, participant_exact_mean), names_to = "measure", values_to = "proportion") %>% ggplot() + geom_density(aes(x = proportion, fill = measure)) + theme_classic() + xlim(c(0,1))
+```
+
+### Man In Lab Training
+
+```{r message=FALSE, warning=FALSE}
+man_training_tags <- wordsense_tags %>% filter(transcript_id == 26671)
+
+man_in_lab_comparison <- create_comparisons(man_training_tags,
+                                                       c("edinburgh_in_lab_staff"),
+                                                       "in_lab_training")
+
+man_in_lab_comparison$corpus_name = "Manchester"
+man_in_lab_comparison$work_unit <- NA
+```
+#### By Pair
+```{r}
+man_training_by_pair <- man_in_lab_comparison %>% 
+  group_by(participant_list, target_participant, comparison_participant, 
+           corpus_name,user_group) %>% 
+  summarize(num_comparisons = n(),
+            num_any_one = sum(any_one),
+            num_exact_match = sum(exact_match),
+            prop_any_one = num_any_one/num_comparisons,
+            prop_exact_match = num_exact_match/num_comparisons) %>% filter(num_comparisons >= 15)
+
+man_training_by_pair %>% pivot_longer(c(prop_any_one, prop_exact_match), names_to = "measure", values_to = "proportion") %>% ggplot() + geom_density(aes(x = proportion, fill = measure))+facet_grid(measure~ user_group, scales = "free_y")+ xlim(c(0,1)) + theme_classic() 
+```
+
+#### By Participant
+```{r}
+#pivot longer 
+man_training_by_participant <- man_training_by_pair %>% pivot_longer(c(target_participant, comparison_participant), names_to = "participant_comparison_type", values_to = "participant_id") %>%
+  group_by(participant_id) %>% summarize(participant_exact_mean = mean(prop_exact_match),
+                                         participant_any_mean = mean(prop_any_one))
+man_training_by_participant %>% pivot_longer(c(participant_any_mean, participant_exact_mean), names_to = "measure", values_to = "proportion") %>% ggplot() + geom_density(aes(x = proportion, fill = measure)) + theme_classic() + xlim(c(0,1))
+```
+
+### Subject Pool Training
+```{r, work-unit-setup, message=FALSE, warning=FALSE}
+message("Processing subject pool by work unit...")
+
+work_unit_list <- c(4752, 4753,4755,4760, 4769)
+work_unit_tags_list <- lapply(work_unit_list, function(work_unit){
+  work_unit_tags <- wordsense_tags %>% filter(utterance_id %in% filter(work_unit_content_tbl,
+                                                                       work_unit_id == work_unit)$utterance_id)
+  return(work_unit_tags)})
+```
+
+```{r message=FALSE}
+sp_training_comparison <- rbind(work_unit_agreement(work_unit_list[[1]],
+                                                    work_unit_tags_list[[1]],
+                                                    c("subject_pool"),
+                                                    "subject_pool"),
+                                work_unit_agreement(work_unit_list[[2]],
+                                                    work_unit_tags_list[[2]],
+                                                    c("subject_pool"),
+                                                    "subject_pool"),
+                                work_unit_agreement(work_unit_list[[3]],
+                                                    work_unit_tags_list[[3]],
+                                                    c("subject_pool"),
+                                                    "subject_pool"),
+                                work_unit_agreement(work_unit_list[[4]],
+                                                    work_unit_tags_list[[4]],
+                                                    c("subject_pool"),
+                                                    "subject_pool"),
+                                work_unit_agreement(work_unit_list[[5]],
+                                                    work_unit_tags_list[[5]],
+                                                    c("subject_pool"),
+                                                    "subject_pool"))
+sp_training_comparison$corpus_name = "Providence"
+sp_training_comparison <- sp_training_comparison %>% separate(user_group, into = c("user_group", "work_unit"), sep = "[+]")
+```
+
+#### By Pair
+```{r}
+sp_training_by_pair <- sp_training_comparison %>% 
+  group_by(participant_list, target_participant, comparison_participant, 
+           corpus_name, work_unit, user_group) %>% 
+  summarize(num_comparisons = n(),
+            num_any_one = sum(any_one),
+            num_exact_match = sum(exact_match),
+            prop_any_one = num_any_one/num_comparisons,
+            prop_exact_match = num_exact_match/num_comparisons) %>% filter(num_comparisons >= 15)
+
+sp_training_by_pair %>% pivot_longer(c(prop_any_one, prop_exact_match), names_to = "measure", values_to = "proportion") %>% ggplot() + geom_density(aes(x = proportion, fill = measure))+facet_grid(work_unit~ user_group, scales = "free_y")+ xlim(c(0,1)) + theme_classic() 
+
+sp_training_by_pair %>% pivot_longer(c(prop_any_one, prop_exact_match), names_to = "measure", values_to = "proportion") %>% ggplot() + geom_density(aes(x = proportion, fill = measure))+ xlim(c(0,1)) + theme_classic() 
+```
+#### By Participant
+
+```{r}
+#pivot longer 
+ sp_training_by_participant <- sp_training_by_pair %>%
+  pivot_longer(c(target_participant, comparison_participant), 
+               names_to = "participant_comparison_type", 
+               values_to = "participant_id") %>%
+  group_by(participant_id, work_unit) %>% 
+  summarize(participant_exact_mean = mean(prop_exact_match),
+            participant_any_mean = mean(prop_any_one))
+
+sp_training_by_participant %>% 
+  pivot_longer(c(participant_any_mean, participant_exact_mean), 
+               names_to = "measure", 
+               values_to = "proportion") %>% 
+  ggplot() + geom_density(aes(x = proportion, fill = measure)) + 
+  theme_classic()+facet_wrap(~work_unit, scales = "free_y")+ xlim(c(0,1))
+```
+
+### RPP Training
+```{r message=FALSE}
+rpp_groups <- c("berkeley_rpp", "princeton_rpp", "edinburgh_rpp")
+
+rpp_training_comparison <- rbind(work_unit_agreement(work_unit_list[[1]],
+                                                    work_unit_tags_list[[1]],
+                                                    rpp_groups,
+                                                    "rpp"),
+                                work_unit_agreement(work_unit_list[[2]],
+                                                    work_unit_tags_list[[2]],
+                                                   rpp_groups,
+                                                    "rpp"),
+                                work_unit_agreement(work_unit_list[[3]],
+                                                    work_unit_tags_list[[3]],
+                                                    rpp_groups,
+                                                    "rpp"),
+                                work_unit_agreement(work_unit_list[[4]],
+                                                    work_unit_tags_list[[4]],
+                                                    rpp_groups,
+                                                    "rpp"),
+                                work_unit_agreement(work_unit_list[[5]],
+                                                    work_unit_tags_list[[5]],
+                                                    rpp_groups,
+                                                    "rpp"))
+rpp_training_comparison$corpus_name = "Providence"
+rpp_training_comparison <- rpp_training_comparison %>% separate(user_group, into = c("user_group", "work_unit"), sep = "[+]")
+```
+
+#### By Pair
+```{r}
+rpp_training_by_pair <- rpp_training_comparison %>% 
+  group_by(participant_list, target_participant, comparison_participant, 
+           corpus_name, work_unit, user_group) %>% 
+  summarize(num_comparisons = n(),
+            num_any_one = sum(any_one),
+            num_exact_match = sum(exact_match),
+            prop_any_one = num_any_one/num_comparisons,
+            prop_exact_match = num_exact_match/num_comparisons) %>% filter(num_comparisons >= 15)
+
+rpp_training_by_pair %>% pivot_longer(c(prop_any_one, prop_exact_match), names_to = "measure", values_to = "proportion") %>% ggplot() + geom_density(aes(x = proportion, fill = measure))+facet_grid(work_unit~ user_group, scales = "free_y")+ xlim(c(0,1)) + theme_classic() 
+
+rpp_training_by_pair %>% pivot_longer(c(prop_any_one, prop_exact_match), names_to = "measure", values_to = "proportion") %>% ggplot() + geom_density(aes(x = proportion, fill = measure))+ xlim(c(0,1)) + theme_classic() 
+```
+#### By Participant
+```{r}
+#pivot longer 
+ rpp_training_by_participant <- rpp_training_by_pair %>%
+  pivot_longer(c(target_participant, comparison_participant), 
+               names_to = "participant_comparison_type", 
+               values_to = "participant_id") %>%
+  group_by(participant_id, work_unit) %>% 
+  summarize(participant_exact_mean = mean(prop_exact_match),
+            participant_any_mean = mean(prop_any_one))
+
+rpp_training_by_participant %>% 
+  pivot_longer(c(participant_any_mean, participant_exact_mean), 
+               names_to = "measure", 
+               values_to = "proportion") %>% 
+  ggplot() + geom_density(aes(x = proportion, fill = measure)) + 
+  theme_classic()+facet_wrap(~work_unit, scales = "free_y")+ xlim(c(0,1))
+```
+
+## Double Coded Tokens
+For each token, we need the % of participant pairs that had partial and full agreement
+
+### PVD Double Coded
+```{r}
+pvd_double_coded_tokens <- wordsense_tags %>% 
+  filter(!transcript_id %in% c(26671, 5686), 
+         user_type == "berkeley_in_lab_staff") %>% 
+  group_by(token_id) %>% 
+  summarize(participant_count = length(unique(participant_id)))
+
+pvd_staff_comparison_tags <- wordsense_tags %>% 
+  filter(token_id %in% filter(pvd_double_coded_tokens, 
+                              participant_count >= 2)$token_id, 
+         user_type == "berkeley_in_lab_staff")
+
+pvd_in_lab_double_coded <- create_comparisons(pvd_staff_comparison_tags,
+                                              c("berkeley_in_lab_staff"),
+                                              "in_lab_training")
+
+pvd_in_lab_double_coded$corpus_name = "Providence"
+
+pvd_in_lab_double_coded_by_pair <- pvd_in_lab_double_coded %>% 
+  group_by(participant_list, corpus_name, target_participant, 
+           comparison_participant, user_group) %>% 
+  summarize(num_comparisons = n(),
+            num_any_one = sum(any_one),
+            num_exact_match = sum(exact_match),
+            prop_any_one = num_any_one/num_comparisons,
+            prop_exact_match = num_exact_match/num_comparisons) %>% filter(num_comparisons >= 15)
+
+pvd_in_lab_double_coded_by_pair %>% 
+  pivot_longer(c(prop_any_one, prop_exact_match), 
+               names_to = "measure", 
+               values_to = "proportion") %>% 
+  ggplot() + geom_density(aes(x = proportion, fill = measure))+ 
+  xlim(c(0,1)) + theme_classic() 
+```
+
+### MAN Double coded
+```{r}
+man_double_coded_tokens <- wordsense_tags %>% filter(!transcript_id %in% c(26671, 5686), user_type == "edinburgh_in_lab_staff") %>% group_by(token_id) %>% summarize(participant_count = length(unique(participant_id)))
+
+man_staff_comparison_tags <- wordsense_tags %>% filter(token_id %in% filter(man_double_coded_tokens, participant_count >= 2)$token_id, user_type == "edinburgh_in_lab_staff")
+
+man_in_lab_double_coded <- create_comparisons(man_staff_comparison_tags,
+                                                       c("edinburgh_in_lab_staff"),
+                                                       "in_lab_training")
+
+man_in_lab_double_coded$corpus_name = "Manchester"
+
+man_in_lab_double_coded_by_pair <- man_in_lab_double_coded %>% 
+  group_by(participant_list, corpus_name, target_participant, 
+           comparison_participant, user_group) %>% 
+  summarize(num_comparisons = n(),
+            num_any_one = sum(any_one),
+            num_exact_match = sum(exact_match),
+            prop_any_one = num_any_one/num_comparisons,
+            prop_exact_match = num_exact_match/num_comparisons) %>% filter(num_comparisons >= 15)
+
+man_in_lab_double_coded_by_pair %>% pivot_longer(c(prop_any_one, prop_exact_match), names_to = "measure", values_to = "proportion") %>% ggplot() + geom_density(aes(x = proportion, fill = measure))+ xlim(c(0,1)) + theme_classic() 
+```
+
+### RPP Double Coded
+```{r}
+rpp_participant_groups <- c("berkeley_rpp", "princeton_rpp", "edinburgh_rpp")
+rpp_double_coded_tokens <- wordsense_tags %>% 
+  filter(!transcript_id %in% c(26671, 5686), 
+         user_type %in% rpp_participant_groups) %>% 
+  group_by(token_id) %>% 
+  summarize(participant_count = length(unique(participant_id)))
+
+rpp_double_coded_tags <- wordsense_tags %>% 
+  filter(token_id %in% filter(rpp_double_coded_tokens, 
+                              participant_count >= 2)$token_id, 
+         user_type %in% rpp_participant_groups)
+
+rpp_double_coded <- create_comparisons(rpp_double_coded_tags,
+                                       rpp_participant_groups,
+                                       "rpp")
+
+rpp_double_coded$corpus_name = "Providence"
+
+rpp_double_coded_by_pair <- rpp_double_coded %>% 
+  group_by(participant_list, corpus_name, target_participant, 
+           comparison_participant, user_group) %>% 
+  summarize(num_comparisons = n(),
+            num_any_one = sum(any_one),
+            num_exact_match = sum(exact_match),
+            prop_any_one = num_any_one/num_comparisons,
+            prop_exact_match = num_exact_match/num_comparisons) %>% filter(num_comparisons >= 15)
+
+rpp_double_coded_by_pair %>% pivot_longer(c(prop_any_one, prop_exact_match), names_to = "measure", values_to = "proportion") %>% ggplot() + geom_density(aes(x = proportion, fill = measure))+ xlim(c(0,1)) + theme_classic() 
+```
+
+### Subject Pool Double Coding
+```{r}
+
+sp_double_coded_tokens <- wordsense_tags %>% 
+  filter(!transcript_id %in% c(26671, 5686), 
+         user_type == "subject_pool") %>% 
+  group_by(token_id) %>% 
+  summarize(participant_count = length(unique(participant_id)))
+
+sp_double_coded_tags <- wordsense_tags %>% 
+  filter(token_id %in% filter(sp_double_coded_tokens, 
+                              participant_count >= 2)$token_id, 
+         user_type =="subject_pool")
+
+sp_double_coded <- create_comparisons(sp_double_coded_tags,
+                                       "subject_pool",
+                                       "subject_pool")
+
+
+sp_double_coded$corpus_name = "Providence"
+
+sp_double_coded_by_pair <- sp_double_coded %>% 
+  group_by(participant_list, corpus_name, target_participant, 
+           comparison_participant, user_group) %>% 
+  summarize(num_comparisons = n(),
+            num_any_one = sum(any_one),
+            num_exact_match = sum(exact_match),
+            prop_any_one = num_any_one/num_comparisons,
+            prop_exact_match = num_exact_match/num_comparisons) %>% filter(num_comparisons >= 15)
+
+sp_double_coded_by_pair %>% 
+  pivot_longer(c(prop_any_one, prop_exact_match), 
+               names_to = "measure", 
+               values_to = "proportion") %>% 
+  ggplot() + geom_density(aes(x = proportion, fill = measure))+ 
+  xlim(c(0,1)) + theme_classic() 
+```
+
+## Random Baselines
+```{r}
+random_tags_bound <- rbind(wordsense_tags %>% 
+                             select(participant_id, user_type, token_id, 
+                                    sense_name, utterance_id, transcript_id),
+                         random_tags %>% 
+                           select(participant_id, user_type, token_id, 
+                                  sense_name, utterance_id, transcript_id))
+```
+### PVD Baselines
+```{r}
+rand_pvd_training_tags <- random_tags_bound %>% filter(transcript_id == 5686)
+
+rand_pvd_in_lab_comparison <- create_comparisons(rand_pvd_training_tags,
+                                                 c("berkeley_in_lab_staff",
+                                                   "random_participant"),
+                                                 "in_lab_training",
+                                                 target_target_participant = -99)
+rand_pvd_in_lab_comparison$corpus_name = "Providence"
+rand_pvd_in_lab_comparison$work_unit <- NA
+
+rand_pvd_training_by_pair <- rand_pvd_in_lab_comparison %>%
+  group_by(participant_list, target_participant, 
+           comparison_participant, user_group) %>% 
+  summarize(num_comparisons = n(),
+            num_any_one = sum(any_one),
+            num_exact_match = sum(exact_match),
+            prop_any_one = num_any_one/num_comparisons,
+            prop_exact_match = num_exact_match/num_comparisons) %>% filter(num_comparisons >= 15)
+
+rand_pvd_training_by_participant <- rand_pvd_training_by_pair %>%
+  pivot_longer(c(target_participant, comparison_participant), 
+               names_to = "participant_comparison_type", 
+               values_to = "participant_id") %>%
+  group_by(participant_id) %>% 
+  summarize(participant_exact_mean = mean(prop_exact_match),
+            participant_any_mean = mean(prop_any_one))
+```
+
+#### PVD Double Coded Baseline
+
+```{r}
+pvd_random_comparison_tags <- random_tags_bound %>% 
+  filter(token_id %in% filter(pvd_double_coded_tokens, 
+                              participant_count >= 2)$token_id, 
+         user_type %in% c("berkeley_in_lab_staff",
+                                                   "random_participant"))
+
+rand_pvd_dc_comparison <- create_comparisons(pvd_random_comparison_tags,
+                                                 c("berkeley_in_lab_staff",
+                                                   "random_participant"),
+                                                 "rand_in_lab_training",
+                                                 target_target_participant = -99)
+rand_pvd_dc_comparison$corpus_name = "Providence"
+
+rand_pvd_dc_by_pair <- rand_pvd_dc_comparison %>%
+  group_by(participant_list, target_participant, 
+           comparison_participant, user_group) %>% 
+  summarize(num_comparisons = n(),
+            num_any_one = sum(any_one),
+            num_exact_match = sum(exact_match),
+            prop_any_one = num_any_one/num_comparisons,
+            prop_exact_match = num_exact_match/num_comparisons) %>% filter(num_comparisons >= 15)
+
+rand_pvd_dc_participant <- rand_pvd_dc_by_pair %>%
+  pivot_longer(c(target_participant, comparison_participant), 
+               names_to = "participant_comparison_type", 
+               values_to = "participant_id") %>%
+  group_by(participant_id) %>% 
+  summarize(participant_exact_mean = mean(prop_exact_match),
+            participant_any_mean = mean(prop_any_one))
+```
+
+### MAN Baselines
+
+```{r}
+rand_man_training_tags <- random_tags_bound %>% filter(transcript_id == 26671)
+
+rand_man_in_lab_comparison <- create_comparisons(rand_man_training_tags,
+                                                 c("edinburgh_in_lab_staff",
+                                                   "random_participant"),
+                                                 "rand_in_lab_training",
+                                                 target_target_participant = -99)
+rand_man_in_lab_comparison$corpus_name <- "Manchester"
+rand_man_in_lab_comparison$work_unit <- NA
+
+rand_man_training_by_pair <- rand_man_in_lab_comparison %>%
+  group_by(participant_list, target_participant, 
+           comparison_participant, user_group) %>% 
+  summarize(num_comparisons = n(),
+            num_any_one = sum(any_one),
+            num_exact_match = sum(exact_match),
+            prop_any_one = num_any_one/num_comparisons,
+            prop_exact_match = num_exact_match/num_comparisons) %>% filter(num_comparisons >= 15)
+
+rand_man_training_by_participant <- rand_man_training_by_pair %>%
+  pivot_longer(c(target_participant, comparison_participant), 
+               names_to = "participant_comparison_type", 
+               values_to = "participant_id") %>%
+  group_by(participant_id) %>% 
+  summarize(participant_exact_mean = mean(prop_exact_match),
+            participant_any_mean = mean(prop_any_one))
+```
+
+#### MAN Double Coded Baseline
+
+```{r}
+man_random_comparison_tags <- random_tags_bound %>% 
+  filter(token_id %in% filter(man_double_coded_tokens, 
+                              participant_count >= 2)$token_id, 
+         user_type %in% c("edinburgh_in_lab_staff",
+                                                   "random_participant"))
+
+rand_man_dc_comparison <- create_comparisons(man_random_comparison_tags,
+                                                 c("edinburgh_in_lab_staff",
+                                                   "random_participant"),
+                                                 "rand_in_lab_training",
+                                                 target_target_participant = -99)
+rand_man_dc_comparison$corpus_name = "Manchester"
+
+rand_man_dc_by_pair <- rand_man_dc_comparison %>%
+  group_by(participant_list, target_participant, 
+           comparison_participant, user_group) %>% 
+  summarize(num_comparisons = n(),
+            num_any_one = sum(any_one),
+            num_exact_match = sum(exact_match),
+            prop_any_one = num_any_one/num_comparisons,
+            prop_exact_match = num_exact_match/num_comparisons) %>% filter(num_comparisons >= 15)
+
+rand_man_dc_participant <- rand_man_dc_by_pair %>%
+  pivot_longer(c(target_participant, comparison_participant), 
+               names_to = "participant_comparison_type", 
+               values_to = "participant_id") %>%
+  group_by(participant_id) %>% 
+  summarize(participant_exact_mean = mean(prop_exact_match),
+            participant_any_mean = mean(prop_any_one))
+```
+### Subject Pool Baselines
+
+```{r, message=FALSE, warning=FALSE}
+message("Processing random subject pool by work unit...")
+
+work_unit_list <- c(4752, 4753,4755,4760, 4769)
+random_work_unit_tags_list <- lapply(work_unit_list, function(work_unit){
+  work_unit_tags <- random_tags_bound %>% filter(utterance_id %in% filter(work_unit_content_tbl,
+                                                                       work_unit_id == work_unit)$utterance_id)
+  return(work_unit_tags)})
+```
+
+```{r message=FALSE}
+rand_sp_training_comparison <- rbind(work_unit_agreement(work_unit_list[[1]],
+                                                         random_work_unit_tags_list[[1]],
+                                                         c("subject_pool",
+                                                           "random_participant"),
+                                                         "subject_pool",
+                                                         target_target_participant = -99),
+                                     work_unit_agreement(work_unit_list[[2]],
+                                                         random_work_unit_tags_list[[2]],
+                                                         c("subject_pool",
+                                                           "random_participant"),
+                                                         "subject_pool",
+                                                         target_target_participant = -99),
+                                     work_unit_agreement(work_unit_list[[3]],
+                                                         random_work_unit_tags_list[[3]],
+                                                         c("subject_pool",
+                                                           "random_participant"),
+                                                         "subject_pool",
+                                                         target_target_participant = -99),
+                                     work_unit_agreement(work_unit_list[[4]],
+                                                         random_work_unit_tags_list[[4]],
+                                                         c("subject_pool",
+                                                           "random_participant"),
+                                                         "subject_pool",
+                                                         target_target_participant = -99),
+                                     work_unit_agreement(work_unit_list[[5]],
+                                                         random_work_unit_tags_list[[5]],
+                                                         c("subject_pool",
+                                                           "random_participant"),
+                                                         "subject_pool",
+                                                         target_target_participant = -99))
+rand_sp_training_comparison$corpus_name = "Providence"
+rand_sp_training_comparison <- rand_sp_training_comparison %>% separate(user_group, into = c("user_group", "work_unit"), sep = "[+]")
+
+rand_sp_training_by_pair <- rand_sp_training_comparison %>% 
+  group_by(participant_list, target_participant, comparison_participant, work_unit, user_group) %>% 
+  summarize(num_comparisons = n(),
+            num_any_one = sum(any_one),
+            num_exact_match = sum(exact_match),
+            prop_any_one = num_any_one/num_comparisons,
+            prop_exact_match = num_exact_match/num_comparisons) %>% filter(num_comparisons >= 15)
+
+rand_sp_training_by_pair %>% pivot_longer(c(prop_any_one, prop_exact_match), names_to = "measure", values_to = "proportion") %>% ggplot() + geom_density(aes(x = proportion, fill = measure))+facet_grid(work_unit~ user_group, scales = "free_y")+ xlim(c(0,1)) + theme_classic() 
+
+rand_sp_training_by_pair %>% pivot_longer(c(prop_any_one, prop_exact_match), names_to = "measure", values_to = "proportion") %>% ggplot() + geom_density(aes(x = proportion, fill = measure))+ xlim(c(0,1)) + theme_classic() 
+```
+#### SP Double Coded Baseline
+
+```{r}
+sp_double_coded_tokens <- random_tags_bound %>% 
+  filter(!transcript_id %in% c(26671, 5686), 
+         user_type %in% c("subject_pool", "random_participant")) %>% 
+  group_by(token_id) %>% 
+  summarize(participant_count = length(unique(participant_id)))
+
+rand_sp_double_coded_tags <- random_tags_bound %>% 
+  filter(token_id %in% filter(sp_double_coded_tokens, 
+                              participant_count >= 2)$token_id, 
+         user_type %in% c("subject_pool", "random_participant"))
+
+rand_sp_double_coded <- create_comparisons(rand_sp_double_coded_tags,
+                                      c("subject_pool", "random_participant"),
+                                      "random_subject_pool",
+                                      target_target_participant = -99)
+
+
+rand_sp_double_coded$corpus_name = "Providence"
+
+rand_sp_double_coded_by_pair <- rand_sp_double_coded %>% 
+  group_by(participant_list, target_participant, 
+           comparison_participant, user_group) %>% 
+  summarize(num_comparisons = n(),
+            num_any_one = sum(any_one),
+            num_exact_match = sum(exact_match),
+            prop_any_one = num_any_one/num_comparisons,
+            prop_exact_match = num_exact_match/num_comparisons) %>% filter(num_comparisons >= 15)
+
+rand_sp_double_coded_by_pair %>% 
+  pivot_longer(c(prop_any_one, prop_exact_match), 
+               names_to = "measure", 
+               values_to = "proportion") %>% 
+  ggplot() + geom_density(aes(x = proportion, fill = measure))+ 
+  xlim(c(0,1)) + theme_classic() 
+```
+### RPP Baseline
+
+```{r message=FALSE}
+rand_rpp_groups <- c("berkeley_rpp", "princeton_rpp", "edinburgh_rpp", "random_participant")
+
+rand_rpp_training_comparison <- rbind(work_unit_agreement(work_unit_list[[1]],
+                                                         random_work_unit_tags_list[[1]],
+                                                         rand_rpp_groups,
+                                                         "rpp",
+                                                         target_target_participant = -99),
+                                     work_unit_agreement(work_unit_list[[2]],
+                                                         random_work_unit_tags_list[[2]],
+                                                         rand_rpp_groups,
+                                                         "rpp",
+                                                         target_target_participant = -99),
+                                     work_unit_agreement(work_unit_list[[3]],
+                                                         random_work_unit_tags_list[[3]],
+                                                         rand_rpp_groups,
+                                                         "rpp",
+                                                         target_target_participant = -99),
+                                     work_unit_agreement(work_unit_list[[4]],
+                                                         random_work_unit_tags_list[[4]],
+                                                         rand_rpp_groups,
+                                                         "rpp",
+                                                         target_target_participant = -99),
+                                     work_unit_agreement(work_unit_list[[5]],
+                                                         random_work_unit_tags_list[[5]],
+                                                         rand_rpp_groups,
+                                                         "rpp",
+                                                         target_target_participant = -99))
+rand_rpp_training_comparison$corpus_name = "Providence"
+rand_rpp_training_comparison <- rand_rpp_training_comparison %>% separate(user_group, into = c("user_group", "work_unit"), sep = "[+]")
+
+rand_rpp_training_by_pair <- rand_rpp_training_comparison %>% 
+  group_by(participant_list, target_participant, comparison_participant, work_unit, user_group) %>% 
+  summarize(num_comparisons = n(),
+            num_any_one = sum(any_one),
+            num_exact_match = sum(exact_match),
+            prop_any_one = num_any_one/num_comparisons,
+            prop_exact_match = num_exact_match/num_comparisons) %>% filter(num_comparisons >= 15)
+
+rand_rpp_training_by_pair %>% pivot_longer(c(prop_any_one, prop_exact_match), names_to = "measure", values_to = "proportion") %>% ggplot() + geom_density(aes(x = proportion, fill = measure))+facet_grid(work_unit~ user_group, scales = "free_y")+ xlim(c(0,1)) + theme_classic() 
+
+rand_rpp_training_by_pair %>% pivot_longer(c(prop_any_one, prop_exact_match), names_to = "measure", values_to = "proportion") %>% ggplot() + geom_density(aes(x = proportion, fill = measure))+ xlim(c(0,1)) + theme_classic() 
+```
+
+#### RPP Double Coded Baseline
+```{r}
+rpp_double_coded_tokens <- random_tags_bound %>% 
+  filter(!transcript_id %in% c(26671, 5686), 
+         user_type %in% rand_rpp_groups) %>% 
+  group_by(token_id) %>% 
+  summarize(participant_count = length(unique(participant_id)))
+
+rand_rpp_double_coded_tags <- random_tags_bound %>% 
+  filter(token_id %in% filter(rpp_double_coded_tokens, 
+                              participant_count >= 2)$token_id, 
+         user_type %in% rand_rpp_groups)
+
+rand_rpp_double_coded <- create_comparisons(rand_rpp_double_coded_tags,
+                                      rand_rpp_groups,
+                                      "random_rpp",
+                                      target_target_participant = -99)
+
+
+rand_rpp_double_coded$corpus_name = "Providence"
+
+rand_rpp_double_coded_by_pair <- rand_rpp_double_coded %>% 
+  group_by(participant_list, target_participant, 
+           comparison_participant, user_group) %>% 
+  summarize(num_comparisons = n(),
+            num_any_one = sum(any_one),
+            num_exact_match = sum(exact_match),
+            prop_any_one = num_any_one/num_comparisons,
+            prop_exact_match = num_exact_match/num_comparisons) %>% filter(num_comparisons >= 15)
+
+rand_rpp_double_coded_by_pair %>% 
+  pivot_longer(c(prop_any_one, prop_exact_match), 
+               names_to = "measure", 
+               values_to = "proportion") %>% 
+  ggplot() + geom_density(aes(x = proportion, fill = measure))+ 
+  xlim(c(0,1)) + theme_classic() 
+```
+
+## Back Together
+```{r}
+#bind back in the pairs
+full_training_comparisons <- rbind(pvd_in_lab_comparison, 
+                                        man_in_lab_comparison, 
+                                        sp_training_comparison, 
+                                        rpp_training_comparison) %>% 
+  mutate(token_type = "training")
+
+full_double_coded_comparisons <- rbind(pvd_in_lab_double_coded, 
+                                            man_in_lab_double_coded, 
+                                            rpp_double_coded,
+                                            sp_double_coded) %>% 
+  mutate(token_type = "double_coded",
+         work_unit = NA)
+
+full_comparisons <- rbind(full_training_comparisons,
+                          full_double_coded_comparisons)
+
+full_by_pair_comparisons <- full_comparisons %>% 
+  group_by(participant_list, target_participant, comparison_participant, 
+           corpus_name, work_unit, user_group) %>% 
+  summarize(num_comparisons = n(),
+            num_any_one = sum(any_one),
+            num_exact_match = sum(exact_match),
+            prop_any_one = num_any_one/num_comparisons,
+            prop_exact_match = num_exact_match/num_comparisons) %>% filter(num_comparisons >= 15)
+
+full_by_participant_comparisons <- full_by_pair_comparisons %>%
+  pivot_longer(c(target_participant, comparison_participant), 
+               names_to = "participant_comparison_type", 
+               values_to = "participant_id") %>%
+  group_by(participant_id, work_unit, user_group, corpus_name) %>% 
+  summarize(participant_exact_mean = mean(prop_exact_match),
+            participant_any_mean = mean(prop_any_one))
+
+saveRDS(full_comparisons, file= here("data/processed_data/participant_quality/full_comparisons.RData"))
+```
+### Random Baselines
+```{r}
+#bind back in the random baselines
+rand_full_training_comparisons <- rbind(rand_pvd_in_lab_comparison, 
+                                        rand_man_in_lab_comparison, 
+                                        rand_sp_training_comparison, 
+                                        rand_rpp_training_comparison) %>% 
+  mutate(token_type = "training")
+
+rand_full_double_coded_comparisons <- rbind(rand_pvd_dc_comparison, 
+                                            rand_man_dc_comparison, 
+                                            rand_rpp_double_coded,
+                                            rand_sp_double_coded) %>% 
+  mutate(token_type = "double_coded",
+         work_unit = NA)
+
+rand_full_comparisons <- rbind(rand_full_training_comparisons,
+                          rand_full_double_coded_comparisons)
+
+rand_full_by_pair_comparisons <- rand_full_comparisons %>% 
+  group_by(participant_list, target_participant, comparison_participant, 
+           corpus_name, work_unit, user_group) %>% 
+  summarize(num_comparisons = n(),
+            num_any_one = sum(any_one),
+            num_exact_match = sum(exact_match),
+            prop_any_one = num_any_one/num_comparisons,
+            prop_exact_match = num_exact_match/num_comparisons) %>% filter(num_comparisons >= 15)
+
+rand_full_by_participant_comparisons <- rand_full_by_pair_comparisons %>%
+  pivot_longer(c(target_participant, comparison_participant), 
+               names_to = "participant_comparison_type", 
+               values_to = "participant_id") %>%
+  group_by(participant_id, work_unit, user_group, corpus_name) %>% 
+  summarize(participant_exact_mean = mean(prop_exact_match),
+            participant_any_mean = mean(prop_any_one))
+
+saveRDS(rand_full_comparisons, file= here("data/processed_data/participant_quality/rand_full_comparisons.RData"))
+```
+## Identify Poor Users
+For each participant pool user group work unit, find any user 2 STD below the mean
+```{r}
+
+all_participant_agreement <- full_by_participant_comparisons %>% filter(!is.na(work_unit)) %>% left_join(full_by_participant_comparisons%>% filter(!is.na(work_unit)) %>% group_by(user_group, work_unit) %>% 
+  summarize(wu_any_one_mean = mean(participant_any_mean),
+            wu_any_one_sd = sd(participant_any_mean),
+            wu_any_one_cutoff = wu_any_one_mean - 2*wu_any_one_sd,
+            wu_exactly_match_mean = mean(participant_exact_mean),
+            wu_exact_sd = sd(participant_exact_mean),
+            wu_exactly_match_cutoff = wu_exactly_match_mean - 2*wu_exact_sd))
+```
+
+
+```{r}
+write_csv(all_participant_agreement, paste0(write_path, "participant_drop_metrics.csv"))
+```
+### Drop users
+```{r drop-users}
+#drop any participant who is below 2 SD on either the any one condition or the exact match condition
+participant_drop = all_participant_agreement %>% 
+  filter(participant_any_mean <= wu_any_one_cutoff |
+           participant_exact_mean <= wu_exactly_match_cutoff)
+all_drop = participant_drop$participant_id
+
+#This drops about 4% of tags
+clean_wordsense_tags <- wordsense_tags %>% filter(!participant_id %in% all_drop)
+```
+
+
+```{r}
+write_path = here("data/processed_data")
+#save as RDS (keeps the list of possible senses)
+saveRDS(clean_wordsense_tags, file = paste0(write_path, "/clean_wordsense_tags.RData"))
+write_csv(clean_wordsense_tags %>% select(-sense_options, -lemma_sense_options, -gloss_sense_options), file = paste0(write_path, "/clean_wordsense_tags.csv"))
+
+saveRDS(wordsense_tags, file = paste0(write_path, "/wordsense_tags.RData"))
+write_csv(wordsense_tags %>% select(-sense_options, -lemma_sense_options, -gloss_sense_options), file = paste0(write_path, "/wordsense_tags.csv"))
+```
+
+# Preprocessing
+## Majority Tags
+Takes about an hour, grab a snack!
+```{r majority-tags-random, eval=FALSE, include=FALSE}
+no_idk_tags <- clean_wordsense_tags %>% filter(sense_name != 'idk')
+
+pb <- progress_bar$new(total = length(unique(no_idk_tags$token_id)),
+                         format = " processing [:bar] :percent in :elapsedfull eta: :eta")
+
+majority_tags_random_ties_df <- no_idk_tags %>% group_by(token_id)%>%
+    group_modify(~get_majority_random_tag(.x)) %>% ungroup()
+```
+
+```{r}
+temp_tags <- majority_tags_random_ties_df %>% 
+  select(childes_token_id, gloss_with_replacement, 
+         wn_pos, fixed_pos, type, gloss_type, 
+         sense_name, sense_definition, utterance_id, 
+         age_interval, speaker_role,
+          lemma_sense_count,
+          gloss_sense_count, num_poss_options)
+temp_tags %>% write_csv(here("processed_data/majority_wordsense_tags.csv"))
+```
+
+
+```{r eval=FALSE, include=FALSE}
+saveRDS(majority_tags_random_ties_df, file = paste0(write_path, "/majority_tag_random_ties.RData"))
+write_csv(majority_tags_random_ties_df %>% select(-sense_options, -lemma_sense_options, -gloss_sense_options), here('data/processed_data/majority_tag_random_ties.csv'))
+```
+
+
+#Icebox
+## Filter to exact cdi type
+
+```{r}
+WSWG <- read_csv(here("data/raw_data/WSWG_50percentproducing_cleaned.csv"))
+majority_tags_random_ties_df <- readRDS(file = paste0(write_path, "/majority_tag_random_ties.RData"))
+
+filtered_out_majority_tags <- majority_tags_random_ties_df %>% filter(!type %in% WSWG$type)
+filtered_out_counts <- table(filtered_out_majority_tags$type)
+```
+```{r}
+semcor_senses <- readRDS(here("data/processed_data/semcor_sense_tags.RData"))
+taggable_semcor_seses <- semcor_senses %>% filter(in_cdi, matching_sense)
+filtered_out_semcor_senses <- taggable_semcor_seses %>% filter(!type %in% WSWG$type)
+filtered_out_counts <- table(filtered_out_semcor_senses$type)
+```
+
+```{r}
+#semcor vs wordsense tags
+verb_type_list <- c('break+v','catch+v','cook+v','cry+v','draw+v','drop+v','fall+v','find+v','finish+v','fit+v','fix+v','give+v','go+v','hear+v','hit+v','hold+v','hurt+v','jump+v','kick+v','knock+v','like+v','make+v','need+v','open+v','play+v','run+v','shake+v','show+v','sit+v','spill+v','stand+v','stick+v','take+v','touch+v','try+v','watch+v','work+v')
+
+ws_vs_semcor <- majority_tag_random_ties %>% 
+  filter(type %in% verb_type_list, speaker_role == "Caregiver") %>% 
+  group_by(type, sense_name) %>% summarize(adult_ws_tag_n = n()) %>% 
+  arrange(type, -adult_ws_tag_n) %>% 
+  full_join(majority_tag_random_ties %>% 
+  filter(type %in% verb_type_list, speaker_role == "Child") %>% 
+  group_by(type, sense_name) %>% summarize(child_ws_tag_n = n()) %>% 
+  arrange(type, -child_ws_tag_n)) %>%
+  full_join(semcor_senses %>% 
+              filter(type %in% verb_type_list) %>% 
+              group_by(type, sense_name) %>% 
+              summarize(semcor_tag_n = n())) %>%
+  left_join(wordnet30_df %>% select(sense_name, sense_definition))
+
+adult_vs_semcor_list <- c('animal+n','away+r','baby+n','bad+a','big+a','bottle+n','car+n','clean+v','coffee+n','cow+n','cut+v','doctor+n','do+v','eat+v','egg+n','face+n','first+a','food+n','friend+n','full+a','garage+n','get+v','good+a','go+v','hair+n','hand+n','happy+a','have+v','here+r','hide+v','house+n','ice+n','leg+n','like+v','listen+v','little+a','long+a','make+v','milk+n','moon+n','more+r','morning+n','new+a','night+n','now+r','old+a','on+r','orange+n','out+r','people+n','person+n','ride+v','room+n','say+v','school+n','sing+v','star+n','stick+v','stop+v','street+n','tape+n','there+r','think+v','tree+n','try+v','up+r','walk+v','watch+v','water+n','window+n','work+n')
+adult_vs_semcor <- majority_tag_random_ties %>% 
+  filter(type %in% adult_vs_semcor_list, speaker_role == "Caregiver") %>% 
+  group_by(type, sense_name) %>% summarize(adult_ws_tag_n = n()) %>% 
+  arrange(type, -adult_ws_tag_n) %>% 
+  full_join(majority_tag_random_ties %>% 
+  filter(type %in% adult_vs_semcor_list, speaker_role == "Child") %>% 
+  group_by(type, sense_name) %>% summarize(child_ws_tag_n = n()) %>% 
+  arrange(type, -child_ws_tag_n)) %>%
+  full_join(semcor_senses %>% 
+              filter(type %in% adult_vs_semcor_list) %>% 
+              group_by(type, sense_name) %>% 
+              summarize(semcor_tag_n = n())) %>%
+  left_join(wordnet30_df %>% select(sense_name, sense_definition))
+
+```
+
+```{r}
+#simplex
+tagged_three <- majority_tags_random_ties_df %>% distinct(type, sense_options, num_wn_senses) %>% unnest(sense_options)  %>% rename(sense_name = sense_options)%>%left_join(majority_tags_random_ties_df %>% group_by(type, sense_name) %>% summarize(num_tags = n())) %>% filter(num_wn_senses == 3, !sense_name %in% c("other_meanings", "wrong_pos", "idk"))
+```
+
+```{r check majority tags}
+#check to see if any tokens in majority tags are _not_ in clean_wordsense_tags and vice versa
+write_path = here("data/processed_data")
+
+in_maj_not_in_clean <- setdiff(majority_tags_random_ties_df$token_id, clean_wordsense_tags$token_id)
+
+in_clean_not_majority <- setdiff(clean_wordsense_tags$token_id, majority_tags_random_ties_df$token_id)
+
+majority_tags_random_ties_df %>% filter(token_id %in% in_maj_not_in_clean) %>% group_by(participant_id) %>% summarize(n=n())
+clean_wordsense_tags %>% filter(token_id %in% in_clean_not_majority,
+                                sense_name != "idk") %>% group_by(participant_id) %>%
+  summarize(n = n()) %>% left_join(all_participant_agreement %>% select(participant_id, participant_exact_mean,wu_exactly_match_cutoff, participant_any_mean, wu_any_one_cutoff))
+```

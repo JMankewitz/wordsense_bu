@@ -1,0 +1,1176 @@
+---
+title: "bucld_analysis"
+author: "Jessica Mankewitz"
+date: "4/16/2021"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+library(lme4)
+library(lmerTest)
+library(optimx)
+library(merTools)
+
+library(progress)
+library(childesr)
+library(here)
+library(patchwork)
+library(ggExtra)
+library(purrr)
+library(tidyverse)
+
+#set up reticulate for nltk
+library(reticulate)
+use_virtualenv(here("ws_env"))
+wn <- import("nltk.corpus")$wordnet
+lemmatizer <- import("nltk.stem")$WordNetLemmatizer
+```
+
+# Preprocessing
+Import data from childes and preprocessed majority tags df
+```{r import-data, cache=TRUE}
+childes_tokens <- childesr::get_tokens(token = "*", corpus = c("Providence", "Manchester"), db_version = "2018.1") %>%
+   mutate(speaker_role = case_when(speaker_code %in% c("MOT", "FAT") ~ "Caregiver",
+                                   speaker_code == "CHI" ~ "Child",
+                                   TRUE ~ "Other"))
+childes_utterances <- childesr::get_utterances(corpus = c("Providence", "Manchester"),db_version = "2018.1")
+
+#generated in preprocessing
+majority_tags.df <- read_csv(here("data/processed_data/majority_wordsense_tags.csv"))
+all_raw_tags.df <- read_csv(here("data/processed_data/wordsense_tags.csv"))
+raw_tags_participants <- read_csv(here("data/raw_data/raw_tags.csv"))
+```
+Join in utterance and speaker info
+```{r}
+full_tag_info.df <- majority_tags.df %>% 
+  left_join(childes_tokens %>% select("childes_token_id" = "id", "corpus_name", 
+                                      "transcript_id", "utterance_id", "target_child_name", "target_child_age")) %>% 
+  left_join(childes_utterances %>% select("utterance_id" = "id", "utterance_order", "gloss")) %>%
+  mutate(type_sense = paste(type, sense_name, sep = "-"))
+
+full_sense_tags <- full_tag_info.df %>% 
+  filter(sense_name != "wrong_pos") %>%
+   #take out earliest and latest months
+   filter(age_interval != "(09,12]", age_interval != "(48,51]") %>%
+   #regroup age intervals
+   mutate(grouped_age_interval = case_when(age_interval %in% c("(12,15]", "(15,18]") ~ "(12,18]",
+                                            age_interval %in% c("(18,21]", "(21,24]") ~ "(18,24]",
+                                             age_interval %in% c("(24,27]", "(27,30]") ~ "(24,30]",
+                                            age_interval %in% c("(30,33]","(33,36]")~ "(30,36]",
+                                            age_interval %in% c("(36,39]","(39,42]") ~ "(36,42]",
+                                            age_interval %in% c("(42,45]","(45,48]")~ "(42,48]"),
+          start_age_in_months = case_when(age_interval %in% c("(12,15]", "(15,18]") ~ 12,
+                                            age_interval %in% c("(18,21]", "(21,24]") ~ 18,
+                                             age_interval %in% c("(24,27]", "(27,30]") ~ 24,
+                                            age_interval %in% c("(30,33]","(33,36]")~ 30,
+                                            age_interval %in% c("(36,39]","(39,42]") ~ 36,
+                                            age_interval %in% c("(42,45]","(45,48]")~ 42))
+```
+
+the _kind_ of senses, coarse vs broad categories
+
+```{r}
+get_lex_category <- function(sense_name){
+   if (sense_name == "other_meanings"){return("other_meanings")} else {
+   return(unlist(wn$synset(sense_name)$lexname()))}
+}
+sense_name_to_lex_map <- full_sense_tags %>% distinct(sense_name)
+sense_name_to_lex_map$category <- unlist(lapply(sense_name_to_lex_map$sense_name, get_lex_category))
+full_sense_tags <- full_sense_tags %>% left_join(sense_name_to_lex_map) %>% mutate(type_category = paste0(type, "-", category))
+```
+
+# Count Info (Intro)
+```{r}
+full_sense_tags %>% group_by(grouped_age_interval) %>% summarise(num_children = n_distinct(target_child_name))
+
+full_sense_tags %>% group_by(speaker_role) %>% summarise(n=n())
+
+saveRDS(full_sense_tags, file=here("data/processed_data/full_sense_tags.rds"))
+```
+
+```{r}
+#for each child, speaker_role,for each type, for each time period, boolean if seen with multiple senses
+
+polysemy_counts <- full_sense_tags %>% filter(sense_name != "other_meanings") %>%
+   group_by(target_child_name, grouped_age_interval,start_age_in_months, type_sense) %>%
+   mutate(n_sense_type_instances = n()) %>% filter(n_sense_type_instances >1) %>%
+  group_by(target_child_name, speaker_role, type, grouped_age_interval,start_age_in_months) %>%
+  summarize(num_senses = length(unique(sense_name))) %>%
+  mutate(multiple_senses = ifelse(num_senses >1, TRUE, FALSE))
+polysemy_counts
+polysemy_counts %>% write_csv(here("data/processed_data/polysemous_in_interval.csv"))
+```
+
+# Stephan's analysis
+
+```{r}
+#library('lme4')
+#library('boot')
+#library('ggplot2')
+#library('tictoc')
+
+
+	
+
+# amount of probability mass one 2nd or other senses in a time period
+# assume continuity on which one is the highest probability sense
+
+#filter to type+sense combos that are seen at least twice at any point in time
+maj_tags = full_sense_tags %>% filter(sense_name != "other_meanings") %>%
+   group_by(target_child_name, type_sense) %>%
+   mutate(n_sense_type_instances = n()) %>% filter(n_sense_type_instances >1) %>% ungroup()
+
+chi_maj_tags = maj_tags %>% filter(speaker_role == "Child",
+                                   !sense_name %in% c("wrong_pos", "other_meanings"),
+                                   start_age_in_months >= 12,
+                                   start_age_in_months < 48)
+
+#what does this do??
+chi_maj_tags$downsampled_start_age_in_months = sapply(chi_maj_tags$start_age_in_months, function(x){floor(x /6)*6})
+
+chi_maj_tags$downsampled_start_age_in_months_adjusted = chi_maj_tags$downsampled_start_age_in_months - 12
+ 
+# get the most common sense for each age interval, child, and lemma
+#names(chi_maj_tags)
+#TODO: why gloss type here and not type? Do we want to pull apart dog and dogs? glass and glasses? 
+mfs = 	aggregate(sense_name ~ type + downsampled_start_age_in_months + target_child_name, chi_maj_tags, function(x){
+		x_tab = table(x)
+		return(names(x_tab[order(x_tab)])[1])
+})
+mfs <- mfs %>% rename("most_common_sense_name" = "sense_name")
+
+# merge most common sense back into chi_maj_tags
+chi_maj_tags = merge(chi_maj_tags, mfs)
+
+chi_maj_tags$is_most_common_sense_name = as.numeric(chi_maj_tags$sense_name == chi_maj_tags$most_common_sense_name)
+
+chi_maj_tags$is_not_most_common_sense_name = !chi_maj_tags$is_most_common_sense_name
+
+# Bad model: prop per gloss_type is very far from normal (mode = 0)
+# lm1 = glmer(is_not_most_common_sense_name ~  downsampled_start_age_in_months_adjusted + (1 | gloss_type) +(downsampled_start_age_in_months_adjusted | target_child_name), data = subset(chi_maj_tags, !is.na(is_most_common_sense_name)), family = binomial)
+
+
+# summary(lm1)
+# inv.logit(-3.97) # probability of using a random type with more than one sense at 12 months is < 2%
+
+# inv.logit(-3.97 + (36*.013)) # am I overlooking something in the prediction 
+# test = predict(lm2)
+# chi_maj_tags$prediction = sapply(predict(lm1), inv.logit)
+
+tic()
+lm3 = glmer(is_not_most_common_sense_name ~  downsampled_start_age_in_months_adjusted  + (downsampled_start_age_in_months_adjusted | target_child_name), 
+            data = subset(maj_tags_ugh, !is.na(is_most_common_sense_name)), 
+            family = binomial,
+            control=glmerControl(optimizer="bobyqa", optCtrl=list(maxfun=400000)))
+toc()
+i_am_finished()
+summary(lm3)
+
+sessionInfo()
+chi_maj_tags$prediction = sapply(predict(lm3), inv.logit)
+mean(chi_maj_tags$prediction)
+
+# plotting
+mcs_perChild = aggregate(is_not_most_common_sense_name ~ type + target_child_name + downsampled_start_age_in_months, chi_maj_tags, any)
+
+mcs_AcrossChildren = aggregate(is_not_most_common_sense_name ~ target_child_name + downsampled_start_age_in_months,mcs_perChild, mean)
+
+ggplot(mcs_AcrossChildren) + geom_point(aes(x= downsampled_start_age_in_months, y = is_not_most_common_sense_name, color= target_child_name)) + geom_line(aes(x= downsampled_start_age_in_months, y = is_not_most_common_sense_name, color= target_child_name)) + theme_classic()
+
+# re: Model 1: the sense preference for each word is not normal
+
+usage_per_noun = aggregate(is_not_most_common_sense_name ~ type, chi_maj_tags, mean) 
+
+names(usage_per_noun)
+#pdf('~/Downloads/nounNCMS.pdf')
+ggplot(usage_per_noun) + geom_histogram(aes(x= is_not_most_common_sense_name)) + theme_classic() + xlab('Proportion Not Majority Sense')
+dev.off()
+
+# two problems here 
+# #1 some have > .75 not majority sense
+# #2 nothing near normal
+#plot with predict!
+
+```
+
+```{r}
+
+#tidy_adult = tidy(age_model_adult, effects = "fixed")
+tidy_child = tidy(lm3, effects = "fixed")
+
+new_data <- chi_maj_tags %>% distinct(grouped_age_interval, downsampled_start_age_in_months_adjusted) %>% 
+  mutate(downsampled_start_age_in_months_adjusted = downsampled_start_age_in_months_adjusted+12)
+
+model_results = new_data %>% mutate(prediction = predict(lm3, newdata = new_data, re.form = NA),
+                                    prediction = inv.logit(prediction),
+                                               speaker_role = "Child")
+#model_results <- rbind(new_new_data %>% mutate(prediction = predict(lm3, newdata = new_data, re.form = NA),
+#                                               speaker_role = "Child"),
+#                       cbind(new_new_data,
+#                             prediction = predict(age_model_child, newdata = new_new_data, re.form = NA)) %>% 
+#                         mutate(speaker_role = "Child"))
+
+regression_results = tibble(speaker_role = "Child",
+                            model_intercept = inv.logit(filter(tidy_child, term == "(Intercept)")$estimate),
+                            model_slope = filter(tidy_child, term == "downsampled_start_age_in_months_adjusted")$estimate,
+                            p_value_age = filter(tidy_child, term == "downsampled_start_age_in_months_adjusted")$p.value)
+
+ggplot(mcs_AcrossChildren) + 
+  geom_abline(data = regression_results, aes(intercept = model_intercept, slope = model_slope), color = "green")+
+  geom_point(aes(x= downsampled_start_age_in_months, y = is_not_most_common_sense_name, color= target_child_name)) + 
+  geom_line(aes(x= downsampled_start_age_in_months, y = is_not_most_common_sense_name, color= target_child_name)) +
+  geom_line(data = model_results, aes(x = downsampled_start_age_in_months_adjusted, y = prediction, group = 1), size = .75)+ 
+  
+  theme_classic()
+
+base_plot <- usage_per_noun %>%
+   ggplot() +
+   geom_point(aes(x = grouped_age_interval, y = num_senses_over_num_types, color = target_child_name), alpha = .5) + 
+   geom_line(aes(x = grouped_age_interval, y = num_senses_over_num_types, color = target_child_name, group = target_child_name), alpha = .5) + geom_hline(yintercept=1) + 
+  geom_ribbon(data = ci_data, aes(x = grouped_age_interval, ymin = low_ci, ymax = high_ci, group = 1),fill = "grey70", alpha = .5)+
+  
+  geom_line(data = model_results, aes(x = grouped_age_interval, y = prediction, group = 1), size = .75)+
+  #geom_abline(data = regression_results, aes(intercept = model_intercept, slope = model_slope), color = "green") +
+   #add regression and slope
+   #geom_line(data = model_base_interval, aes(group=1, x = grouped_age_interval, y = pred)) + 
+   facet_wrap(~speaker_role) + theme_classic() + theme(legend.position = "none") + 
+   labs(x = "Child Age in Months",
+        y = "No. of Meanings \n per No. of Word Types")
+   
+```
+
+# Base Analysis - Num senses/num types over time
+
+Before grouping and dropping early/late months
+```{r}
+full_tag_info.df %>% filter(sense_name != "wrong_pos") %>% 
+   group_by(corpus_name, target_child_name, speaker_role, age_interval) %>%
+      summarize(num_tags = n(),
+         num_unique_types = n_distinct(type),
+                unique_types = list(unique(type)),
+                num_unique_senses = n_distinct(type_sense),
+                unique_senses = list(unique(type_sense)),
+                num_senses_over_num_types = num_unique_senses/num_unique_types) %>%
+   ggplot(aes(x = age_interval, y = num_senses_over_num_types, color = target_child_name)) +
+   geom_point() + 
+   geom_line(aes(group = target_child_name)) + geom_hline(yintercept=1) + 
+   theme_classic() + facet_wrap(~speaker_role) + theme(axis.text.x = element_text(angle = 65, vjust = 0.5, hjust=.5))
+
+
+full_tag_info.df %>% filter(sense_name != "wrong_pos") %>% 
+   group_by(corpus_name, target_child_name, speaker_role, age_interval) %>%
+      summarize(num_tags = n(),
+         num_unique_types = n_distinct(type),
+                unique_types = list(unique(type)),
+                num_unique_senses = n_distinct(type_sense),
+                unique_senses = list(unique(type_sense)),
+                num_senses_over_num_types = num_unique_senses/num_unique_types) %>%
+   group_by(speaker_role, age_interval) %>%
+   summarize(mean_proportion = mean(num_senses_over_num_types),
+             sd_proportion = sd(num_senses_over_num_types)) %>%
+   ggplot(aes(x = age_interval, y = mean_proportion, color = speaker_role)) +
+   geom_point(position = position_dodge(.2)) + 
+   geom_errorbar(aes(ymin = mean_proportion - sd_proportion, 
+                     ymax = mean_proportion + sd_proportion), 
+                 position = position_dodge(.2),
+                 width = 0) +
+   geom_line(aes(group = speaker_role), position = position_dodge(.2)) + 
+   geom_hline(yintercept=1) + 
+   theme_classic() + theme(axis.text.x = element_text(angle = 65, vjust = 0.5, hjust=.5))
+```
+### Base Models
+
+```{r}
+
+get_child_interval_counts <- function(sense_tags){
+   sense_tags %>% group_by(corpus_name, target_child_name, speaker_role, grouped_age_interval, start_age_in_months) %>%
+      summarize(num_tags = n(),
+         num_unique_types = n_distinct(type),
+                unique_types = list(unique(type)),
+                num_unique_senses = n_distinct(type_sense),
+                unique_senses = list(unique(type_sense)),
+                num_senses_over_num_types = num_unique_senses/num_unique_types)
+}
+
+base_child_interval_counts <- get_child_interval_counts(full_sense_tags)
+```
+
+```{r}
+age_model_child <- lmer(num_senses_over_num_types ~ start_age_in_months + (start_age_in_months | target_child_name), 
+     data = base_child_interval_counts %>% filter(speaker_role == "Child"),
+     REML = FALSE, 
+     lmerControl(optimizer ='optimx', optCtrl=list(method='nlminb')))
+
+summary(age_model_child)
+```
+
+```{r}
+age_model_adult <- lmer(num_senses_over_num_types ~ start_age_in_months + (start_age_in_months | target_child_name), 
+     data = base_child_interval_counts %>% filter(speaker_role == "Caregiver"),
+     REML = FALSE, 
+     lmerControl(optimizer ='optimx', optCtrl=list(method='nlminb')))
+
+summary(age_model_adult)
+```
+
+```{r temp-revise}
+#explore plotting?
+library(broom)
+df_new <- base_child_interval_counts %>% ungroup() %>% filter(speaker_role == "Caregiver")
+pred <- cbind(df_new, predictInterval(age_model_adult, df_new, which = "fixed"))
+pred %>% distinct(start_age_in_months, upr, lwr)
+ggplot(pred) + 
+  geom_line(aes(group=target_child_name,grouped_age_interval, fit, color = target_child_name)) +
+  geom_ribbon(aes(group=target_child_name,grouped_age_interval, ymin = lwr, ymax = upr, fill = target_child_name), alpha = .2) +
+  geom_point(aes(grouped_age_interval, y = num_senses_over_num_types, color = target_child_name))
+
+predict(age_model_adult, re.form = NA, newdata = new_data)
+tidy(age_model_adult, conf.int = TRUE, effects = "fixed")
+
+```
+
+```{r}
+#bootstrap confidence intervals
+
+new_data <- base_child_interval_counts %>% ungroup() %>% distinct(start_age_in_months)
+adult_boot <- bootMer(age_model_adult, nsim=1000,re.form=NA, FUN = function(x)predict(x, newdata = new_data, re.form=NA))
+
+get_ci <- function(x, quant){quantile(x, probs = quant)}
+```
+
+```{r}
+child_boot <- bootMer(age_model_child, nsim=1000,re.form=NA, FUN = function(x)predict(x, newdata = new_data, re.form=NA))
+```
+```{r}
+low_ci <- apply(child_boot$t, 2, get_ci, quant = .025)
+high_ci <- apply(child_boot$t, 2, get_ci, quant = 0.975)
+ci_data_child <- cbind(base_child_interval_counts %>% ungroup() %>% distinct(grouped_age_interval, start_age_in_months), low_ci) %>% mutate(speaker_role = "Child") %>% cbind(high_ci)
+```
+
+
+```{r}
+low_ci <- apply(adult_boot$t, 2, get_ci, quant = .025)
+high_ci <- apply(adult_boot$t, 2, get_ci, quant = 0.975)
+ci_data_adult <- cbind(base_child_interval_counts %>% ungroup() %>% distinct(grouped_age_interval, start_age_in_months), low_ci) %>% mutate(speaker_role = "Caregiver") %>% cbind(high_ci)
+ci_data = rbind(ci_data_child, ci_data_adult)
+
+tidy_adult = tidy(age_model_adult, effects = "fixed")
+tidy_child = tidy(age_model_child, effects = "fixed")
+
+new_new_data <- base_child_interval_counts %>% ungroup() %>% 
+                               distinct(grouped_age_interval, start_age_in_months)
+
+model_results <- rbind(cbind(new_new_data,
+                             prediction = predict(age_model_adult, newdata = new_new_data, re.form = NA)) %>% 
+                         mutate(speaker_role = "Caregiver"),
+                       cbind(new_new_data,
+                             prediction = predict(age_model_child, newdata = new_new_data, re.form = NA)) %>% 
+                         mutate(speaker_role = "Child"))
+
+regression_results = tibble(speaker_role = c("Caregiver", "Child"),
+                            model_intercept = c(filter(tidy_adult, term == "(Intercept)")$estimate,
+                                               filter(tidy_child, term == "(Intercept)")$estimate),
+                            model_slope = c(filter(tidy_adult, term == "start_age_in_months")$estimate,
+                                               filter(tidy_child, term == "start_age_in_months")$estimate),
+                            p_value_age = c(filter(tidy_adult, term == "start_age_in_months")$p.value,
+                                               filter(tidy_child, term == "start_age_in_months")$p.value)
+                            )
+
+base_plot <- base_child_interval_counts %>%
+   ggplot() +
+   geom_point(aes(x = grouped_age_interval, y = num_senses_over_num_types, color = target_child_name), alpha = .5) + 
+   geom_line(aes(x = grouped_age_interval, y = num_senses_over_num_types, color = target_child_name, group = target_child_name), alpha = .5) + geom_hline(yintercept=1) + 
+  geom_ribbon(data = ci_data, aes(x = grouped_age_interval, ymin = low_ci, ymax = high_ci, group = 1),fill = "grey70", alpha = .5)+
+  
+  geom_line(data = model_results, aes(x = grouped_age_interval, y = prediction, group = 1), size = .75)+
+  #geom_abline(data = regression_results, aes(intercept = model_intercept, slope = model_slope), color = "green") +
+   #add regression and slope
+   #geom_line(data = model_base_interval, aes(group=1, x = grouped_age_interval, y = pred)) + 
+   facet_wrap(~speaker_role) + theme_classic() + theme(legend.position = "none") + 
+   labs(x = "Child Age in Months",
+        y = "No. of Meanings \n per No. of Word Types")
+   
+base_plot
+ggsave(plot = base_plot, filename = here("figures/num_senses_over_types.png"), height = 3, width = 6)
+saveRDS(adult_boot, file = here("data/derived_data/first_adult_model_boot.rds"))
+saveRDS(child_boot, file = here("data/derived_data/first_child_model_boot.rds"))
+
+
+```
+
+```{r}
+#may need to plot adult and child separately? also the predict assumes an increase every month or something??
+base_child_interval_counts %>%
+   ggplot(aes(x = grouped_age_interval, y = num_senses_over_num_types, color = speaker_role)) +
+   geom_point() + 
+   geom_line(aes(group = speaker_role)) + geom_hline(yintercept=1) + 
+   theme_classic() + facet_wrap(~target_child_name)
+
+#compare parents and children over time
+
+base_child_interval_counts %>%
+   group_by(speaker_role, grouped_age_interval) %>%
+   summarize(mean_proportion = mean(num_senses_over_num_types),
+             sd_proportion = sd(num_senses_over_num_types)) %>%
+   ggplot(aes(x = grouped_age_interval, y = mean_proportion, color = speaker_role)) +
+   geom_point(position = position_dodge(.2)) + 
+   geom_errorbar(aes(ymin = mean_proportion - sd_proportion, 
+                     ymax = mean_proportion + sd_proportion), 
+                 position = position_dodge(.2),
+                 width = 0) +
+   geom_line(aes(group = speaker_role), position = position_dodge(.2)) + 
+   geom_hline(yintercept=1) + 
+   theme_classic()
+```
+
+Are these true minimums? Do some sampling!
+
+```{r sample data}
+
+sample_tags <- function(sense_tags, n){
+   #first get counts, drop any interval with < n instances
+   sense_tags %>% group_by(speaker_role, grouped_age_interval) %>%
+      mutate(tag_counts = n_distinct(childes_token_id)) %>%
+      #filter out
+      filter(tag_counts >= n) %>%
+      #sample up to n from each speaker_role/age_interval
+      group_by(speaker_role, grouped_age_interval) %>%
+      sample_n(size = n, replace = F)
+}
+
+get_sampled_tag_interval_counts <- function(sense_tags, n){
+   sense_tags %>% sample_tags(n) %>% 
+      get_child_interval_counts() %>%
+      mutate(sample_size = as.character(n))
+}
+
+sampled_dfs <- rbind(base_child_interval_counts %>% mutate(sample_size = "full"),
+                     get_sampled_tag_interval_counts(full_sense_tags, 500),
+                     get_sampled_tag_interval_counts(full_sense_tags, 1000),
+                     get_sampled_tag_interval_counts(full_sense_tags, 5000),
+                     get_sampled_tag_interval_counts(full_sense_tags, 7500),
+                     get_sampled_tag_interval_counts(full_sense_tags, 10000))
+
+sampled_dfs$sample_size_f = factor(sampled_dfs$sample_size, levels=c("full","500","1000","5000", "7500","10000"))
+
+caregivers_sampled <- sampled_dfs %>%
+   filter(speaker_role == "Caregiver") %>%
+   mutate(condition_child = paste0(sample_size, "-", target_child_name)) %>%
+   ggplot(aes(x = grouped_age_interval, y = num_senses_over_num_types, color = target_child_name)) +
+   geom_point() + 
+   geom_line(aes(group = condition_child, linetype = sample_size_f)) + geom_hline(yintercept=1) + 
+   theme_classic() + ggtitle("Caregivers") + facet_wrap(~sample_size_f)
+
+children_sampled <- sampled_dfs %>%
+   filter(speaker_role == "Child") %>%
+   mutate(condition_child = paste0(sample_size, "-", target_child_name)) %>%
+   ggplot(aes(x = grouped_age_interval, y = num_senses_over_num_types, color = target_child_name)) +
+   geom_point() + 
+   geom_line(aes(group = condition_child, linetype = sample_size_f)) + geom_hline(yintercept=1) + 
+   theme_classic() + ggtitle("Children") + facet_wrap(~sample_size_f)
+
+caregivers_sampled
+children_sampled
+```
+
+q: do the number of unique senses correlate with the number of unique types?
+a: yes, pretty regularly. 
+
+```{r}
+base_child_interval_counts %>% ggplot(aes(x = num_unique_types, y = num_unique_senses)) + 
+   geom_abline(slope=1, intercept=0, alpha = .25) + 
+   geom_abline(slope=2, intercept=0, alpha = .25) + 
+   geom_point(aes(color = target_child_name), alpha = .75) + 
+   facet_grid(rows = vars(grouped_age_interval), cols = vars(speaker_role)) + theme_minimal()
+```
+What about number of tokens?
+```{r}
+base_child_interval_counts %>% ggplot(aes(x = num_tags, y = num_unique_senses)) + 
+   geom_point(aes(color = target_child_name), alpha = .75) + 
+   facet_grid(rows = vars(grouped_age_interval), cols = vars(speaker_role))
+```
+
+Q, todo?: Could be because of the words used earlier vs later? Could these just have a higher # od possible senses because theyre used in more contexts, so theyre more available in early speech? (eg "get", "put")? How to check, based on the # of instances for each type at earliest month vs latest month? get the diff and plot? Are there any types that decrease in representation?
+
+# Check different factors
+
+## Thresholds: >1 instances of type+sense from child
+
+```{r}
+#get child counts per child per interval
+
+child_counts_sense_type_counts <- full_sense_tags %>% 
+   filter(speaker_role == "Child") %>%
+   group_by(target_child_name, grouped_age_interval, type_sense) %>%
+   summarize(n_child_instances = n())
+
+multiple_instances <- full_sense_tags %>% 
+   left_join(child_counts_sense_type_counts) %>% 
+   filter(n_child_instances > 1) %>% 
+   get_child_interval_counts()
+
+multiple_instances %>%
+   ggplot(aes(x = grouped_age_interval, y = num_senses_over_num_types, color = target_child_name)) +
+   geom_point() + 
+   geom_line(aes(group = target_child_name)) + geom_hline(yintercept=1) + 
+   theme_classic() + facet_wrap(~speaker_role) + labs(title = "types and senses with >1 instance for each child in each interval")
+
+multiple_instances %>%
+   group_by(speaker_role, grouped_age_interval) %>%
+   summarize(mean_proportion = mean(num_senses_over_num_types),
+             sd_proportion = sd(num_senses_over_num_types)) %>%
+   ggplot(aes(x = grouped_age_interval, y = mean_proportion, color = speaker_role)) +
+   geom_point(position = position_dodge(.2)) + 
+   geom_errorbar(aes(ymin = mean_proportion - sd_proportion, 
+                     ymax = mean_proportion + sd_proportion), 
+                 position = position_dodge(.2),
+                 width = 0) +
+   geom_line(aes(group = speaker_role), position = position_dodge(.2)) + 
+   geom_hline(yintercept=1) + 
+   theme_classic()
+   
+
+rbind(multiple_instances %>% mutate(condition = ">1 instances from child"),
+      base_child_interval_counts %>% mutate(condition = "any n instances from child")) %>%
+   group_by(speaker_role, grouped_age_interval, condition) %>%
+   summarize(mean_proportion = mean(num_senses_over_num_types),
+             sd_proportion = sd(num_senses_over_num_types)) %>%
+   ggplot(aes(x = grouped_age_interval, y = mean_proportion, color = condition)) +
+   geom_point(position = position_dodge(.2)) + 
+   geom_errorbar(aes(ymin = mean_proportion - sd_proportion, 
+                     ymax = mean_proportion + sd_proportion), 
+                 position = position_dodge(.2),
+                 width = 0) +
+   geom_line(aes(group = condition), position = position_dodge(.2)) + 
+   geom_hline(yintercept=1) + 
+   theme_classic() + facet_wrap(~speaker_role)
+```
+
+```{r}
+age_model_instance_num_child <- lmer(num_senses_over_num_types ~ start_age_in_months + (start_age_in_months | target_child_name), 
+     data = multiple_instances %>% filter(speaker_role == "Child"),
+     REML = FALSE, 
+     lmerControl(optimizer ='optimx', optCtrl=list(method='nlminb')))
+
+summary(age_model_instance_num_child)
+```
+
+```{r}
+age_model_instance_num_adult <- lmer(num_senses_over_num_types ~ start_age_in_months + (start_age_in_months | target_child_name), 
+     data = multiple_instances %>% filter(speaker_role == "Caregiver"),
+     REML = FALSE, 
+     lmerControl(optimizer ='optimx', optCtrl=list(method='nlminb')))
+
+summary(age_model_instance_num_adult)
+```
+
+## Order of introduction
+
+```{r, cache=TRUE}
+
+
+utterance_tokens <- childes_tokens %>% left_join(childes_utterances %>% select("utterance_id" = "id", "utterance_order"))
+
+
+do_windowing <- function(transcript_df, window_size){
+   pb$tick()
+   all_stems = transcript_df$stem
+   utt_order = transcript_df$utterance_order
+   spk_code = transcript_df$speaker_role
+   
+   #get indexes of tokens to iterate over
+   #filter to just tokens produced by child
+   target_token_indexes = which(transcript_df$speaker_role == "Child")
+   rlist = rep("NA", length(all_stems))
+   
+# TODO: make this an sapply, return a single vector, assign it to a column
+
+   for (i in c(target_token_indexes)){
+      utt_index = utt_order[i]
+      utterance_start = max(c(utt_index-window_size,0))
+      utterance_end = utt_index+1
+      target_window_mask = rep(0, length(all_stems))
+      target_window_mask[utt_order >= utterance_start &  utt_order < utterance_end] = 1
+      target_stem = all_stems[i]
+      target_stems = all_stems[which(as.logical(target_window_mask))]
+      target_spk_id = spk_code[which(as.logical(target_window_mask))]
+      #restrict to the stems
+      type_mask = target_stems == target_stem
+      #restrict to first instances in window
+      duplicate_mask = !duplicated(target_stems)
+      #insert the speaker role in the index of the target token
+      rlist[[i]] = target_spk_id[type_mask & duplicate_mask]
+   }
+   #assign to column
+      transcript_df$introduced_by_in_window = unlist(rlist)
+   return(transcript_df)
+}
+```
+
+Do window analysis
+```{r, cache=TRUE}
+
+
+#pb <- progress_bar$new(total = length(unique(childes_tokens$transcript_id)),
+#                         format = " processing [:bar] (:current/:total) :percent in :elapsedfull eta: :eta")
+
+#childes_tokens_window_10 <- utterance_tokens %>% 
+#   mutate(introduced_by_in_window = NULL) %>% 
+#   split(.$transcript_id) %>% 
+#   map_dfr(~do_windowing(.x, 10))
+
+pb <- progress_bar$new(total = length(unique(utterance_tokens$transcript_id)),
+                         format = " processing [:bar] (:current/:total) :percent in :elapsedfull eta: :eta")
+
+childes_tokens_window_100 <- utterance_tokens %>% mutate(introduced_by_in_window = NULL) %>% 
+   split(.$transcript_id)%>% map_dfr(~do_windowing(.x, 100))
+```
+
+```{r, cache=TRUE}
+pb <- progress_bar$new(total = length(unique(utterance_tokens$transcript_id)),
+                         format = " processing [:bar] (:current/:total) :percent in :elapsedfull eta: :eta")
+
+childes_tokens_window_full_transcript <- utterance_tokens %>% mutate(introduced_by_in_window = NULL) %>% 
+   split(.$transcript_id)%>% map_dfr(~do_windowing(.x, Inf))
+```
+Report Windowing
+```{r}
+# window_10_child_tags <- full_sense_tags %>% 
+#    left_join(childes_tokens_window_10 %>% 
+#                 select(childes_token_id = id, introduced_by_in_window)) %>% 
+#    filter(speaker_role == "Child") %>% 
+#    mutate(window_size = "10")
+
+window_100_child_tags <- full_sense_tags %>% 
+   left_join(childes_tokens_window_100 %>% 
+                select(childes_token_id = id, introduced_by_in_window)) %>% 
+   filter(speaker_role == "Child") %>% 
+   mutate(window_size = "100")
+
+window_transcript_child_tags <- full_sense_tags %>% 
+   left_join(childes_tokens_window_full_transcript %>% 
+                select(childes_token_id = id, introduced_by_in_window)) %>% 
+   filter(speaker_role == "Child") %>% 
+   mutate(window_size = "Transcript")
+
+#raw count barplot w/ pos
+rbind( window_100_child_tags, window_transcript_child_tags) %>% 
+   group_by(window_size, wn_pos, introduced_by_in_window) %>% 
+   summarize(introduced_by_tokens = n())%>% 
+   ggplot() + 
+   geom_bar(aes(x = introduced_by_in_window, y = introduced_by_tokens), stat="identity") + 
+   labs(title = "First instance of stem", subtitle = "produced by child") + 
+   facet_grid(vars(wn_pos), vars(window_size), scales = "free_y")
+
+#what proportions of tokens were introduced by speaker, over time?
+rbind( window_100_child_tags, window_transcript_child_tags) %>% 
+   group_by(window_size, grouped_age_interval, introduced_by_in_window) %>% 
+   summarize(introduced_by_tokens_count = n()) %>% 
+   mutate(total = sum(introduced_by_tokens_count), prop = introduced_by_tokens_count / total) %>%
+   ggplot(aes(x = grouped_age_interval, y = prop, color = introduced_by_in_window)) +
+   geom_hline(yintercept = .5, alpha = .5) +
+   geom_point(position = position_dodge(.2)) + 
+   geom_line(aes(group = introduced_by_in_window), position = position_dodge(.2)) + 
+   theme_classic() + facet_wrap(~window_size) + ylim(0, 1) 
+
+#What kind of types produced by the child were introduced by the adult?
+window_100_child_tags %>% filter(introduced_by_in_window != "Child") %>% group_by(type) %>% summarize(n = n()) %>% mutate(percentage = n*100/sum(n)) %>% arrange(-n)
+
+#What kind of types produced by the child were introduced by the child?
+window_100_child_tags %>% filter(introduced_by_in_window == "Child") %>% group_by(type) %>% summarize(n = n()) %>% mutate(percentage = n*100/sum(n)) %>% arrange(-n)
+```
+
+Do the thresholding
+
+```{r}
+child_introduced_senses_over_type <- rbind(window_100_child_tags, 
+                                           window_transcript_child_tags) %>% 
+   #get the tokens introduced by the child
+   filter(introduced_by_in_window %in% c("Child")) %>% 
+   group_by(target_child_name, grouped_age_interval, start_age_in_months, window_size) %>%
+   summarize(num_tags = n(),
+             num_unique_types = n_distinct(type),
+             num_unique_senses = n_distinct(type_sense),
+             num_senses_over_num_types = num_unique_senses/num_unique_types)
+
+child_introduced_senses_over_type %>%
+   ggplot(aes(x = grouped_age_interval, y = num_senses_over_num_types, color = target_child_name)) +
+   geom_point() + 
+   geom_line(aes(group = target_child_name)) + 
+   geom_hline(yintercept=1) + 
+   facet_wrap(~window_size) + 
+   labs(title = "Unique senses/unique types for types introduced by child in window") + 
+   theme_classic()
+
+
+child_introduced_senses_over_type %>%
+   group_by(window_size, grouped_age_interval) %>%
+   summarize(mean_proportion = mean(num_senses_over_num_types),
+             sd_proportion = sd(num_senses_over_num_types)) %>%
+   ggplot(aes(x = grouped_age_interval, y = mean_proportion, color = window_size)) +
+   geom_point(position = position_dodge(.2)) + 
+   geom_errorbar(aes(ymin = mean_proportion - sd_proportion, 
+                     ymax = mean_proportion + sd_proportion), 
+                 position = position_dodge(.2),
+                 width = 0) +
+   geom_line(aes(group = window_size), position = position_dodge(.2)) + 
+   geom_hline(yintercept=1) + 
+   theme_classic()
+```
+
+```{r}
+age_model_window_100_child <- lmer(num_senses_over_num_types ~ start_age_in_months + (start_age_in_months | target_child_name), 
+     data = child_introduced_senses_over_type %>% filter(window_size == "100"),
+     REML = FALSE, 
+     lmerControl(optimizer ='optimx', optCtrl=list(method='nlminb')))
+
+summary(age_model_window_100_child)
+```
+
+```{r}
+age_model_window_full_child <- lmer(num_senses_over_num_types ~ start_age_in_months + (start_age_in_months | target_child_name), 
+     data = child_introduced_senses_over_type %>% filter(window_size == "Transcript"),
+     REML = FALSE, 
+     lmerControl(optimizer ='optimx', optCtrl=list(method='nlminb')))
+
+summary(age_model_window_full_child)
+```
+
+## Coarse vs fine sense categories
+```{r}
+full_sense_tags %>% 
+   group_by(corpus_name, target_child_name, speaker_role, grouped_age_interval) %>%
+      summarize(num_tags = n(),
+         num_unique_types = n_distinct(type),
+                unique_types = list(unique(type)),
+                num_unique_senses = n_distinct(type_category),
+                unique_senses = list(unique(type_category)),
+                num_senses_over_num_types = num_unique_senses/num_unique_types) %>%
+   ggplot(aes(x = grouped_age_interval, y = num_senses_over_num_types, color = target_child_name)) +
+   geom_point() + 
+   geom_line(aes(group = target_child_name)) + geom_hline(yintercept=1) + 
+   theme_classic() + facet_wrap(~speaker_role) + theme(axis.text.x = element_text(angle = 65, vjust = 0.5, hjust=.5))
+
+course_groupings <- full_sense_tags %>% 
+   group_by(corpus_name, target_child_name, speaker_role, grouped_age_interval, start_age_in_months) %>%
+      summarize(num_tags = n(),
+         num_unique_types = n_distinct(type),
+                unique_types = list(unique(type)),
+                num_unique_senses = n_distinct(type_category),
+                unique_senses = list(unique(type_category)),
+                num_senses_over_num_types = num_unique_senses/num_unique_types)
+
+course_groupings  %>%
+   group_by(speaker_role, grouped_age_interval) %>%
+   summarize(mean_proportion = mean(num_senses_over_num_types),
+             sd_proportion = sd(num_senses_over_num_types)) %>%
+   ggplot(aes(x = grouped_age_interval, y = mean_proportion, color = speaker_role)) +
+   geom_point(position = position_dodge(.2)) + 
+   geom_errorbar(aes(ymin = mean_proportion - sd_proportion, 
+                     ymax = mean_proportion + sd_proportion), 
+                 position = position_dodge(.2),
+                 width = 0) +
+   geom_line(aes(group = speaker_role), position = position_dodge(.2)) + 
+   geom_hline(yintercept=1) + 
+   theme_classic() + theme(axis.text.x = element_text(angle = 65, vjust = 0.5, hjust=.5))
+
+#compare with fine
+rbind(course_groupings %>% 
+         mutate(sense_type = "coarse senses (lexical category)"),
+      base_child_interval_counts %>% mutate(sense_type = "fine senses (synset)")) %>%
+   group_by(speaker_role, grouped_age_interval, sense_type) %>%
+   summarize(mean_proportion = mean(num_senses_over_num_types),
+             sd_proportion = sd(num_senses_over_num_types)) %>%
+   ggplot(aes(x = grouped_age_interval, y = mean_proportion, color = sense_type)) +
+   geom_point(position = position_dodge(.2)) + 
+   geom_errorbar(aes(ymin = mean_proportion - sd_proportion, 
+                     ymax = mean_proportion + sd_proportion), 
+                 position = position_dodge(.2),
+                 width = 0) +
+   geom_line(aes(group = sense_type), position = position_dodge(.2)) + 
+   geom_hline(yintercept=1) + 
+   theme_classic() + facet_wrap(~speaker_role)
+```
+```{r}
+age_model_course_child <- lmer(num_senses_over_num_types ~ start_age_in_months + (start_age_in_months | target_child_name), 
+     data = course_groupings %>% filter(speaker_role == "Child"),
+     REML = FALSE, 
+     lmerControl(optimizer ='optimx', optCtrl=list(method='nlminb')))
+
+summary(age_model_course_child)
+```
+
+```{r}
+age_model_course_adult <- lmer(num_senses_over_num_types ~ start_age_in_months + (start_age_in_months | target_child_name), 
+     data = course_groupings %>% filter(speaker_role == "Caregiver"),
+     REML = FALSE, 
+     lmerControl(optimizer ='optimx', optCtrl=list(method='nlminb')))
+
+summary(age_model_course_adult)
+```
+
+# Analysis 2: Sense Categories
+
+How many types have >1 wordnet synset? 
+```{r}
+full_sense_tags %>% group_by(speaker_role, type) %>% 
+   summarize(n = n_distinct(type_sense)) %>%
+   ggplot() + 
+   geom_histogram(aes(x = n), binwidth = 1) + 
+   facet_wrap(~speaker_role) + labs(title = "Types with N wordnet synset tags")
+
+full_sense_tags %>% group_by(speaker_role, type) %>% 
+   summarize(n = n_distinct(category)) %>%
+   ggplot() + 
+   geom_histogram(aes(x = n), binwidth = 1) + 
+   facet_wrap(~speaker_role) + labs(title = "Types with N wordnet coarse category tags")
+```
+
+
+
+```{r}
+get_child_matrices <- function(pair_count_data, target_pos, target_speaker_role, exclude_categories){
+   #takes in tag_combo_counts
+   #filter to specifications
+   target_data <- pair_count_data %>% 
+      filter(wn_pos == target_pos,
+             speaker_role == target_speaker_role,
+             !x %in% exclude_categories & !y %in% exclude_categories)  %>% 
+      group_by(speaker_role, target_child_name, wn_pos, x, y) %>%
+      summarize(types = list(unique(type)),
+                num_types = n_distinct(type))
+   
+   target_pos_categories <- unique(append(target_data %>% 
+                                             filter(wn_pos == target_pos) %>% pull(x),
+                                          target_data %>% 
+                                             filter(wn_pos == target_pos) %>% pull(y)))
+   children <- unique(target_data$target_child_name)
+   
+   #initialize matrix
+   matrix_children <- array(rep(0,
+                                length(target_pos_categories)*length(target_pos_categories)*length(children)),
+                       dim=c(length(target_pos_categories),length(target_pos_categories),length(children)))
+   
+   for (i in c(1:nrow(target_data))){
+   row = target_data[i,]
+   matrix_children[which(target_pos_categories == row$x), 
+              which(target_pos_categories == row$y), 
+              which(children == row$target_child_name)] = row$num_types
+   matrix_children[which(target_pos_categories == row$y), 
+              which(target_pos_categories == row$x), 
+              which(children == row$target_child_name)] = row$num_types
+   }
+   
+   dimnames(matrix_children) <- list(target_pos_categories, target_pos_categories, children)
+   
+   #turn into list of matrixes instead of 3rd dim
+   get_matrix_list <- function(target_child, target_matrix){
+   return(target_matrix[,,target_child])
+   }
+   matrix_children_list <- lapply(children, get_matrix_list, target_matrix = matrix_children)
+   names(matrix_children_list) <- children
+   return(matrix_children_list)
+}
+
+normalize_matrix_child <- function(target_matrix){
+   return(target_matrix/(sum(target_matrix)/2))
+   }
+
+get_matrix_list <- function(target_child, target_matrix){
+   return(target_matrix[,,target_child])
+}
+
+set_up_heatmap <- function(matrix){
+   dat2 <- matrix %>%
+    tbl_df() 
+   dat2$row <- colnames(dat2)
+   dat2 <- dat2 %>% column_to_rownames('row')
+   dat2 <- dat2 %>% rownames_to_column('Sense1') %>%
+    gather(Sense2, value, -Sense1) %>% arrange(Sense1, Sense2) %>%
+   mutate(value = ifelse(Sense1 == Sense2, NA, value)) 
+
+   return(dat2[!duplicated(t(apply(dat2[c("Sense1", "Sense2")], 1, sort))), ] %>%
+         mutate(label = sub("^(-?)0.", "\\1.", sprintf("%.2f", value)),
+                label = ifelse(label == "NA", NA, label)))
+}
+
+get_matrix_function <- function(list_m, input_function = mean) {  
+   #number of children
+   num_children <- length(list_m);
+   #dimensions of matrix
+   matrix_dimensions <- dim(list_m[[1]]); 	   
+   ar1 <- array(unlist(list_m), c(matrix_dimensions, num_children))
+   apply(ar1, c(1,2), input_function)
+}
+get_matrix_mean <- function(list_m) {  
+   #number of children
+   num_children <- length(list_m);
+   #dimensions of matrix
+   matrix_dimensions <- dim(list_m[[1]]); 	   
+   ar1 <- array(unlist(list_m), c(matrix_dimensions, num_children))
+   apply(ar1, c(1,2), mean)
+}
+```
+
+```{r}
+library(ggplot2)
+# try restricting this analysis to 2< instances of a type+sense, will reduce the number of mistags
+child_counts_sense_type_counts <- full_sense_tags %>% 
+   filter(speaker_role == "Child") %>%
+   group_by(target_child_name, type_sense) %>%
+   summarize(n_child_instances = n())
+
+
+category_list <- full_sense_tags %>% 
+   left_join(child_counts_sense_type_counts) %>% 
+   #optional filter out
+   filter(n_child_instances > 1) %>%
+   group_by(speaker_role, type, wn_pos, target_child_name) %>%
+   summarise(attested_categories = list(unique(category)),
+             num_categories = n_distinct(category))
+
+#quick hist, how many kids have >1 category per type?
+category_list %>% 
+   ggplot() + 
+   geom_histogram(aes(x = num_categories, fill = speaker_role), binwidth = 1) + 
+   facet_wrap(~target_child_name, scales = "free_y") +
+   labs(title = "Number of types with n categories")
+
+tag_combo_counts <- category_list  %>% filter(num_categories >= 2) #optional: restrict to colex
+
+split_categories_pairwise <- function(attested_categories){
+   if (length(attested_categories) == 1){
+      attested_categories = rep(attested_categories, 2)
+   }
+  attested_categories <- sort(attested_categories)
+  partitions <- t(combn(attested_categories, m=2))
+  return(unname(as.list(data.frame(t(partitions)))))
+}
+
+#filter to interval+type combos with more than one attested category
+
+#left with ~5000/14562 types+speaker_role+child facets
+tag_combo_counts
+#get all the pairwise partitions of that category list
+tag_combo_counts$lists_of_combos <- lapply(tag_combo_counts$attested_categories, split_categories_pairwise)
+tag_combo_counts <- tag_combo_counts %>% unnest(cols=lists_of_combos)
+
+tag_combo_counts$x <- unlist(lapply(tag_combo_counts$lists_of_combos, function(cat_list){return(cat_list[1])}))
+tag_combo_counts$y <- unlist(lapply(tag_combo_counts$lists_of_combos, function(cat_list){return(cat_list[2])}))
+
+#verbs
+vspc_children <- get_child_matrices(tag_combo_counts, target_pos = "v", 
+                                    target_speaker_role = "Child", 
+                                    exclude_categories = c("other_meanings", "noun.Tops"))
+
+normalized_vspc_matrix_list <- lapply(vspc_children, normalize_matrix_child)
+
+verb_categories <- colnames(normalized_vspc_matrix_list[[1]])
+mean_verb_across_children <- get_matrix_function(normalized_vspc_matrix_list, mean)
+dimnames(mean_verb_across_children) <- list(verb_categories, verb_categories)
+verbs_heatmap <- set_up_heatmap(mean_verb_across_children) %>% 
+   ggplot(aes(Sense1, Sense2, fill= value)) + 
+   geom_raster()+
+    geom_text(aes(label = label), size = 2.5) +
+    scale_fill_gradient(low = "white", high = "red", limits = c(0,.11)) + 
+      scale_x_discrete(limits = rev) +
+      scale_y_discrete(position = "right",limits = rev) +
+   labs(title = "Mean Prevelance of Sense Category Pair", fill = "Relative \nPrevelance")  + theme_classic() +
+   theme(axis.text.x = element_text(angle = -45, hjust = 0),
+         axis.title.x = element_blank(),
+         axis.title.y = element_blank())
+
+
+#nouns
+nspc_children <- get_child_matrices(tag_combo_counts, "n", "Child", c("other_meanings", "noun.Tops"))
+
+normalized_nspc_matrix_list <- lapply(nspc_children, normalize_matrix_child)
+
+noun_categories <- colnames(normalized_nspc_matrix_list[[1]])
+mean_noun_across_children <- get_matrix_function(normalized_nspc_matrix_list, mean)
+dimnames(mean_noun_across_children) <- list(noun_categories, noun_categories)
+nouns_heatmap <- set_up_heatmap(mean_noun_across_children) %>% 
+   ggplot(aes(Sense1, Sense2, fill= value)) + 
+   geom_raster()+
+    geom_text(aes(label = label), size = 2.5) +
+    scale_fill_gradient(low = "white", high = "red", limits = c(0,.11)) + 
+      scale_x_discrete(position = "top") +
+     # scale_y_discrete(position = "right",limits = rev) +
+   labs(title = "Mean Prevelance of Sense Category Pair", fill = "Relative \nPrevelance")  + theme_classic() +
+   theme(axis.text.x = element_text(angle = 45, hjust = 0),
+         axis.title.x = element_blank(),
+         axis.title.y = element_blank())
+nouns_heatmap
+verbs_heatmap
+ggsave(plot = nouns_heatmap, file = here("figures/child_nouns_heatmap.png"))
+ggsave(plot = verbs_heatmap, file = here("figures/child_verbs_heatmap.png"))
+```
+```{r}
+#what do adults look like
+nspc_adults <- get_child_matrices(tag_combo_counts, "n", "Caregiver", c("other_meanings", "noun.Tops"))
+
+adult_normalized_nspc_matrix_list <- lapply(nspc_adults, normalize_matrix_child)
+
+adult_noun_categories <- colnames(adult_normalized_nspc_matrix_list[[1]])
+mean_noun_across_adults <- get_matrix_function(adult_normalized_nspc_matrix_list, mean)
+dimnames(mean_noun_across_adults) <- list(adult_noun_categories, adult_noun_categories)
+adult_nouns_heatmap <- set_up_heatmap(mean_noun_across_adults) %>% 
+   ggplot(aes(Sense1, Sense2, fill= value)) + 
+   geom_raster()+
+    geom_text(aes(label = label), size = 2.5) +
+    scale_fill_gradient(low = "white", high = "red") + 
+      scale_x_discrete(position = "top") +
+     # scale_y_discrete(position = "right",limits = rev) +
+   labs(title = "Mean Prevelance of Sense Category Pair (Adults)", fill = "Relative \nPrevelance")  + theme_classic() +
+   theme(axis.text.x = element_text(angle = 45, hjust = 0),
+         axis.title.x = element_blank(),
+         axis.title.y = element_blank())
+adult_nouns_heatmap
+
+vspc_adults <- get_child_matrices(tag_combo_counts, "v", "Caregiver", c("other_meanings", "noun.Tops"))
+
+adult_normalized_vspc_matrix_list <- lapply(vspc_adults, normalize_matrix_child)
+
+adult_verb_categories <- colnames(adult_normalized_vspc_matrix_list[[1]])
+mean_verb_across_adults <- get_matrix_function(adult_normalized_vspc_matrix_list, mean)
+dimnames(mean_verb_across_adults) <- list(adult_verb_categories, adult_verb_categories)
+adult_verbs_heatmap <- set_up_heatmap(mean_verb_across_adults)  %>% 
+   ggplot(aes(Sense1, Sense2, fill= value)) + 
+   geom_raster()+
+    geom_text(aes(label = label), size = 2.5) +
+    scale_fill_gradient(low = "white", high = "red") + 
+      scale_x_discrete(limits = rev) +
+      scale_y_discrete(position = "right",limits = rev) +
+   labs(title = "Mean Prevelance of Sense Category Pair", fill = "Relative \nPrevelance")  + theme_classic() +
+   theme(axis.text.x = element_text(angle = -45, hjust = 0),
+         axis.title.x = element_blank(),
+         axis.title.y = element_blank())
+
+adult_verbs_heatmap
+```
+
+
+What kind of utterances drive colexifications?
+```{r}
+category1 <- "verb.motion"
+category2 <- "verb.change"
+
+interesting_types <- unlist(tag_combo_counts %>% 
+   filter(x != "other_meanings", y != "other_meanings",
+          ((x == category1 & y == category2) |
+             (x == category2 & y == category1))) %>%
+   group_by(x, y) %>%
+   summarize(types = list(unique(type)),
+             num_types = n_distinct(type)) %>% pull(types))
+interesting_types <- setdiff(interesting_types, c("baby+n", "man+n"))
+
+interesting_tokens <- full_sense_tags %>% filter(type %in% interesting_types) %>% pull(childes_token_id)
+
+listed_tags <- majority_tags.df %>% left_join(sense_name_to_lex_map) %>% mutate(type_category = paste0(type, "-", category)) %>% 
+  mutate(type_sense = paste(type, sense_name, sep = "-")) %>% group_by(across(-c(sense_name, type_sense, sense_definition))) %>%
+   summarize(sense_category_tags = unique(list(category)),
+             sense_tags = unique(list(sense_name))) %>%
+  left_join(childes_tokens %>% select("childes_token_id" = "id", "corpus_name", 
+                                      "transcript_id", "utterance_id", "target_child_name", "target_child_age")) %>% 
+  left_join(childes_utterances %>% select("utterance_id" = "id", "utterance_order", "gloss")) %>% ungroup()
+View(listed_tags %>% filter(childes_token_id %in% interesting_tokens,
+                            sense_category_tags %in% c(category1, category2)) %>% select(childes_token_id, transcript_id, speaker_role, target_child_name,target_child_age, gloss, gloss_with_replacement, sense_category_tags, sense_tags) %>% arrange(target_child_name, speaker_role, gloss_with_replacement, sense_category_tags, sense_tags))
+```
+
+Audit tags?
+```{r}
+sense_relative_freq <- majority_tags.df %>% filter(sense_name != "wrong_pos") %>% group_by(type, sense_name) %>%
+   summarize(n = n()) %>%
+   mutate(freq = n/sum(n)) %>% arrange(type, freq)
+```
+
+
+# Summary Stats/Counts
+```{r}
+full_tag_info.df %>% 
+   ggplot() + geom_bar(aes(x = age_interval, fill = speaker_role), stat="count", position = "stack") + facet_wrap(~corpus_name)
+
+breaks = c(9, 12, 15, 18, 21, 24, 27, 30, 33,36, 39, 42, 45, 48, 51)
+fixed_tokens <- childes_tokens %>% 
+   mutate(age_interval = cut(target_child_age, breaks = breaks, include.lowest = T)) %>% 
+   filter(speaker_code %in% c("MOT", "FAT", "CHI")) %>% 
+   mutate(speaker_role = case_when(speaker_code == "CHI"~ "Child",
+                                   TRUE ~ "Caregiver")) 
+
+fixed_tokens %>%
+   ggplot() + geom_bar(aes(x = age_interval, fill = speaker_role), stat="count", position = "stack") + facet_wrap(~corpus_name)
+
+fixed_tokens %>%
+   ggplot() + geom_bar(aes(x = age_interval, fill = target_child_name), stat="count", position = "stack") + facet_wrap(~corpus_name)
+
+full_tag_info.df %>% 
+   ggplot() + geom_bar(aes(x = age_interval, fill = target_child_name), stat="count", position = "stack") + facet_wrap(~corpus_name)
+```
+
+```{r}
+full_tag_info.df %>% 
+   ggplot() + geom_bar(aes(x = age_interval, fill = type), stat="count", position = "stack") + facet_wrap(~corpus_name)
+```
+
+
+# Model Specs
+
+
+## Base
+### Adult
+
+```{r base-adult-model}
+age_model_adult <- lmer(num_senses_over_num_types ~ start_age_in_months + (start_age_in_months | target_child_name), 
+     data = base_child_interval_counts %>% filter(speaker_role == "Caregiver"),
+     REML = FALSE, 
+     lmerControl(optimizer ='optimx', optCtrl=list(method='nlminb')))
+
+summary(age_model_adult)
+
+
+```
+
+### Child
+```{r base-child-model}
+age_model_child <- lmer(num_senses_over_num_types ~ start_age_in_months + (start_age_in_months | target_child_name), 
+     data = base_child_interval_counts %>% filter(speaker_role == "Child"),
+     REML = FALSE, 
+     lmerControl(optimizer ='optimx', optCtrl=list(method='nlminb')))
+
+summary(age_model_child)
+```
+### Polynom (Adult)
+
+```{r}
+
+age_model_adult_poly <- lmer(num_senses_over_num_types ~ poly(start_age_in_months, 2) + (poly(start_age_in_months, 2) | target_child_name), 
+     data = base_child_interval_counts %>% filter(speaker_role == "Caregiver"),
+     REML = FALSE, 
+     lmerControl(optimizer ='optimx', optCtrl=list(method='nlminb')))
+
+summary(age_model_adult_poly)
+
+```
+
+### Combined
+```{r}
+age_model_both <- lmer(num_senses_over_num_types ~ start_age_in_months * speaker_role + (start_age_in_months *speaker_role | target_child_name), 
+     data = base_child_interval_counts,
+     REML = FALSE, 
+     lmerControl(optimizer ='optimx', optCtrl=list(method='nlminb')))
+
+summary(age_model_both)
+```
+
+## >1 instances
+## Adult
+### Child
+
+## Order of Intro - Window (100)
+## Order of Intro - Window (First In Transcript)
+
+
