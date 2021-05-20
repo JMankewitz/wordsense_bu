@@ -8,12 +8,9 @@ library("boot")
 library('tictoc')
 library('here')
 library('tidyverse')
-
-
-i_am_finished = function(){
-  command = paste0("osascript -e 'display notification \"R has finished the requested processing task.\" with title \"Processing complete!\"'")
-  system(command)
-}
+library('brms')
+library('rstan')
+library('cmdstanr')
 
 message("Process Data")
 
@@ -21,6 +18,7 @@ message("Process Data")
 full_sense_tags <- readRDS(here("data/processed_data/full_sense_tags.rds"))
 
 run_model_for_speaker <- function(target_speaker_role, start_age, stop_age, bootstrap_num){
+  
   maj_tags <- full_sense_tags %>%
     #drop other meanings
     filter(sense_name != "other_meanings") %>% 
@@ -44,7 +42,7 @@ run_model_for_speaker <- function(target_speaker_role, start_age, stop_age, boot
   most_freq_senses <- aggregate(sense_name ~ type + downsampled_start_age_in_months + target_child_name, 
                                 maj_tags, 
                                 function(x){x_tab = table(x)
-                                return(names(x_tab[order(x_tab)])[1])
+                                return(names(x_tab[order(-x_tab)])[1])
                                 }
   ) %>% rename("most_common_sense_name" = "sense_name")
   
@@ -52,36 +50,44 @@ run_model_for_speaker <- function(target_speaker_role, start_age, stop_age, boot
     #1 if the sense name is anything except the most common sense in that interval- represents polysemy!
     mutate(is_most_common_sense_name = as.numeric(sense_name == most_common_sense_name),
            is_not_most_common_sense_name = as.numeric(sense_name != most_common_sense_name))
-  
+  saveRDS(maj_tags, paste0(here("data/derived_data/"), target_speaker_role, "_data.rds"))
   #run model
   message("Run Model")
-  
-  model = glmer(is_not_most_common_sense_name ~  downsampled_start_age_in_months_adjusted  + (downsampled_start_age_in_months_adjusted | target_child_name), 
-                data = subset(maj_tags, !is.na(is_most_common_sense_name)), 
-                family = binomial,
-                control=glmerControl(optimizer="bobyqa", optCtrl=list(maxfun=400000)))
-  
-  #bootstrap
-  new_data <- maj_tags %>% distinct(downsampled_start_age_in_months_adjusted)
-  
-  message("Get CIs")
-  
-  model_boot <- bootMer(model, nsim=bootstrap_num, 
-                        re.form=NA,  #.progress = "txt", 
-                        parallel = "multicore",
-                        ncpus = 2,
-                        FUN = function(x)inv.logit(predict(x, newdata = new_data, re.form=NA)))
-  
-  saveRDS(model_boot, paste0(here("data/derived_data/"), target_speaker_role, "_model_full.rds"))
-  
-  get_ci <- function(x, quant){quantile(x, probs = quant)}
-  
-  low_ci <- apply(model_boot$t, 2, get_ci, quant = .025)
-  high_ci <- apply(model_boot$t, 2, get_ci, quant = 0.975)
-  ci_model_data <- cbind(maj_tags %>% distinct(grouped_age_interval, downsampled_start_age_in_months_adjusted), low_ci) %>% 
-    mutate(speaker_role = target_speaker_role) %>% cbind(high_ci)
-  #i_am_finished()
-  saveRDS(ci_model_data, paste0(here("data/derived_data/"), target_speaker_role, "_model_CIs.rds"))
+
+  #try model with brm instead
+  model = brm(is_not_most_common_sense_name ~  downsampled_start_age_in_months_adjusted  + (downsampled_start_age_in_months_adjusted | target_child_name),
+              data = subset(maj_tags, !is.na(is_most_common_sense_name)),
+              family = binomial,
+              chains = 4,
+              cores = 16,
+              backend = "cmdstanr")
+  saveRDS(model, paste0(here("data/derived_data/"), target_speaker_role, "_model.rds"))
+  # model = glmer(is_not_most_common_sense_name ~  downsampled_start_age_in_months_adjusted  + (downsampled_start_age_in_months_adjusted | target_child_name),
+  #               data = subset(maj_tags, !is.na(is_most_common_sense_name)),
+  #               family = binomial,
+  #               control=glmerControl(optimizer="bobyqa", optCtrl=list(maxfun=400000)))
+  # saveRDS(model, paste0(here("data/derived_data/"), target_speaker_role, "_model.rds"))
+  # #bootstrap
+  # new_data <- maj_tags %>% distinct(downsampled_start_age_in_months_adjusted)
+
+  # message("Get CIs")
+  # 
+  # #model_boot <- bootMer(model, nsim=bootstrap_num, 
+  # #                      re.form=NA,  #.progress = "txt", 
+  # #                      parallel = "multicore",
+  # #                      ncpus = 2,
+  # #                      FUN = function(x)inv.logit(predict(x, newdata = new_data, re.form=NA)))
+  # 
+  # saveRDS(model_boot, paste0(here("data/derived_data/"), target_speaker_role, "_model_full.rds"))
+  # 
+  # get_ci <- function(x, quant){quantile(x, probs = quant)}
+  # 
+  # low_ci <- apply(model_boot$t, 2, get_ci, quant = .025)
+  # high_ci <- apply(model_boot$t, 2, get_ci, quant = 0.975)
+  # ci_model_data <- cbind(maj_tags %>% distinct(grouped_age_interval, downsampled_start_age_in_months_adjusted), low_ci) %>% 
+  #   mutate(speaker_role = target_speaker_role) %>% cbind(high_ci)
+  # #i_am_finished()
+  # saveRDS(ci_model_data, paste0(here("data/derived_data/"), target_speaker_role, "_model_CIs.rds"))
 }
 
 run_model_for_speaker(target_speaker_role = "Child",

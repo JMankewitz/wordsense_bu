@@ -14,6 +14,7 @@ library(lme4)
 library(lmerTest)
 library(optimx)
 library(merTools)
+library(broom.mixed)
 
 library(progress)
 library(childesr)
@@ -108,47 +109,20 @@ polysemy_counts %>% write_csv(here("data/processed_data/polysemous_in_interval.c
 # Stephan's analysis
 
 ```{r}
-#library('lme4')
-#library('boot')
-#library('ggplot2')
-#library('tictoc')
-
-
-	
 
 # amount of probability mass one 2nd or other senses in a time period
 # assume continuity on which one is the highest probability sense
 
 #filter to type+sense combos that are seen at least twice at any point in time
-maj_tags = full_sense_tags %>% filter(sense_name != "other_meanings") %>%
-   group_by(target_child_name, type_sense) %>%
-   mutate(n_sense_type_instances = n()) %>% filter(n_sense_type_instances >1) %>% ungroup()
 
-chi_maj_tags = maj_tags %>% filter(speaker_role == "Child",
-                                   !sense_name %in% c("wrong_pos", "other_meanings"),
-                                   start_age_in_months >= 12,
-                                   start_age_in_months < 48)
-
-#what does this do??
-chi_maj_tags$downsampled_start_age_in_months = sapply(chi_maj_tags$start_age_in_months, function(x){floor(x /6)*6})
-
-chi_maj_tags$downsampled_start_age_in_months_adjusted = chi_maj_tags$downsampled_start_age_in_months - 12
  
 # get the most common sense for each age interval, child, and lemma
 #names(chi_maj_tags)
 #TODO: why gloss type here and not type? Do we want to pull apart dog and dogs? glass and glasses? 
-mfs = 	aggregate(sense_name ~ type + downsampled_start_age_in_months + target_child_name, chi_maj_tags, function(x){
-		x_tab = table(x)
-		return(names(x_tab[order(x_tab)])[1])
-})
-mfs <- mfs %>% rename("most_common_sense_name" = "sense_name")
+
 
 # merge most common sense back into chi_maj_tags
-chi_maj_tags = merge(chi_maj_tags, mfs)
 
-chi_maj_tags$is_most_common_sense_name = as.numeric(chi_maj_tags$sense_name == chi_maj_tags$most_common_sense_name)
-
-chi_maj_tags$is_not_most_common_sense_name = !chi_maj_tags$is_most_common_sense_name
 
 # Bad model: prop per gloss_type is very far from normal (mode = 0)
 # lm1 = glmer(is_not_most_common_sense_name ~  downsampled_start_age_in_months_adjusted + (1 | gloss_type) +(downsampled_start_age_in_months_adjusted | target_child_name), data = subset(chi_maj_tags, !is.na(is_most_common_sense_name)), family = binomial)
@@ -161,18 +135,7 @@ chi_maj_tags$is_not_most_common_sense_name = !chi_maj_tags$is_most_common_sense_
 # test = predict(lm2)
 # chi_maj_tags$prediction = sapply(predict(lm1), inv.logit)
 
-tic()
-lm3 = glmer(is_not_most_common_sense_name ~  downsampled_start_age_in_months_adjusted  + (downsampled_start_age_in_months_adjusted | target_child_name), 
-            data = subset(maj_tags_ugh, !is.na(is_most_common_sense_name)), 
-            family = binomial,
-            control=glmerControl(optimizer="bobyqa", optCtrl=list(maxfun=400000)))
-toc()
-i_am_finished()
-summary(lm3)
 
-sessionInfo()
-chi_maj_tags$prediction = sapply(predict(lm3), inv.logit)
-mean(chi_maj_tags$prediction)
 
 # plotting
 mcs_perChild = aggregate(is_not_most_common_sense_name ~ type + target_child_name + downsampled_start_age_in_months, chi_maj_tags, any)
@@ -183,12 +146,7 @@ ggplot(mcs_AcrossChildren) + geom_point(aes(x= downsampled_start_age_in_months, 
 
 # re: Model 1: the sense preference for each word is not normal
 
-usage_per_noun = aggregate(is_not_most_common_sense_name ~ type, chi_maj_tags, mean) 
 
-names(usage_per_noun)
-#pdf('~/Downloads/nounNCMS.pdf')
-ggplot(usage_per_noun) + geom_histogram(aes(x= is_not_most_common_sense_name)) + theme_classic() + xlab('Proportion Not Majority Sense')
-dev.off()
 
 # two problems here 
 # #1 some have > .75 not majority sense
@@ -196,6 +154,69 @@ dev.off()
 #plot with predict!
 
 ```
+
+```{r}
+caregiver_data <- readRDS(here("data/derived_data/Caregiver_data.rds"))
+caregiver_model_cis <- readRDS(here("data/derived_data/Caregiver_model_CIs.rds"))
+caregiver_model_full <- readRDS(here("data/derived_data/Caregiver_model_full.rds"))
+caregiver_model <- readRDS(here("data/derived_data/Caregiver_model.rds"))
+
+child_data <- readRDS(here("data/derived_data/Child_data.rds"))
+child_model_cis <- readRDS(here("data/derived_data/Child_model_CIs.rds"))
+child_model_full <- readRDS(here("data/derived_data/Child_model_full.rds"))
+child_model <- readRDS(here("data/derived_data/Child_model.rds"))
+```
+
+```{r}
+child_data %>% ggplot() + geom_histogram(aes(x = is_not_most_common_sense_name))
+```
+
+#plot model
+```{r}
+summary_child_data <- child_data %>% 
+   group_by(target_child_name,type,  downsampled_start_age_in_months_adjusted, grouped_age_interval) %>%
+   summarize(sum_not = sum(is_not_most_common_sense_name),
+             total_seen = n(),
+             avg = sum_not/total_seen) %>%
+   group_by(target_child_name, downsampled_start_age_in_months_adjusted, grouped_age_interval) %>%
+   summarise(avg_avg = mean(avg))
+
+summary_child_data %>% ggplot() + geom_line(aes(x = downsampled_start_age_in_months_adjusted, y = avg_avg, group=target_child_name, color = target_child_name))
+
+tidy_child = tidy(child_model, effects = "fixed")
+tidy_caregiver = tidy(caregiver_model, effects = "fixed")
+
+tidy_comb <- rbind(tidy_child %>% mutate(speaker_role = "Child"),
+                   tidy_caregiver %>% mutate(speaker_role = "Caregiver"))
+tidy_comb_cis <- rbind(child_model_cis %>% mutate(speaker_role = "Child"),
+                   caregiver_model_cis %>% mutate(speaker_role = "Caregiver"))
+
+new_data <- tidy_comb_cis %>% 
+   distinct(grouped_age_interval, downsampled_start_age_in_months_adjusted)
+child_model_results = new_data %>% 
+   mutate(prediction = predict(child_model, newdata = new_data, re.form = NA),
+                                    prediction = inv.logit(prediction),
+                                               speaker_role = "Child")
+
+caregiver_model_results = new_data %>% 
+   mutate(prediction = predict(caregiver_model, newdata = new_data, re.form = NA),
+                                    prediction = inv.logit(prediction),
+                                               speaker_role = "Caregiver")
+
+comb_model_results <- rbind(child_model_results, caregiver_model_results)
+base_plot <- ggplot(tidy_comb_cis) +
+ #  geom_point(aes(x = grouped_age_interval, y = num_senses_over_num_types, color = target_child_name), alpha = .5) + 
+ #  geom_line(aes(x = grouped_age_interval, y = num_senses_over_num_types, color = target_child_name, group = target_child_name), alpha = .5) + geom_hline(yintercept=1) + 
+  geom_ribbon(data = tidy_comb_cis, aes(x = grouped_age_interval, ymin = low_ci, ymax = high_ci, group = 1),fill = "grey70", alpha = .5)+
+  geom_line(data = comb_model_results, aes(x = grouped_age_interval, y = prediction, group = 1), size = .75)+
+  #geom_abline(data = regression_results, aes(intercept = model_intercept, slope = model_slope), color = "green") +
+   #add regression and slope
+   #geom_line(data = model_base_interval, aes(group=1, x = grouped_age_interval, y = pred)) + 
+   facet_wrap(~speaker_role) + theme_classic() + theme(legend.position = "none") + 
+   labs(x = "Child Age in Months")
+base_plot
+```
+
 
 ```{r}
 
