@@ -10,7 +10,7 @@ library('here')
 library('tidyverse')
 library('brms')
 library('rstan')
-#library('cmdstanr')
+library('cmdstanr')
 
 message("Process Data")
 
@@ -57,7 +57,10 @@ run_model_for_speaker <- function(target_speaker_role, start_age, stop_age, boot
   #try model with brm instead
   model = brm(is_not_most_common_sense_name ~  downsampled_start_age_in_months_adjusted  + (downsampled_start_age_in_months_adjusted | target_child_name),
               data = subset(maj_tags, !is.na(is_most_common_sense_name)),
-              family = binomial)
+              family = binomial,
+              chains = 4,
+              cores = 16,
+              backend = "cmdstanr")
   saveRDS(model, paste0(here("data/derived_data/"), target_speaker_role, "_model.rds"))
   # model = glmer(is_not_most_common_sense_name ~  downsampled_start_age_in_months_adjusted  + (downsampled_start_age_in_months_adjusted | target_child_name),
   #               data = subset(maj_tags, !is.na(is_most_common_sense_name)),
